@@ -3,6 +3,7 @@ import {
   Plus, Trash2, ArrowUp, ArrowDown, Repeat, Image as ImageIcon, Video,
   Download, Save, FolderOpen, Sparkles, MessageSquare, Layers,
   Bookmark, X, Copy, Eye, EyeOff, Move, Palette, FileText,
+  ChevronDown, ChevronUp,
 } from 'lucide-react';
 
 /* =========================================================================
@@ -797,6 +798,7 @@ export default function App() {
     typeof window !== 'undefined' && window.innerWidth < 900
   );
   const [zoomed, setZoomed] = useState(false); // mobile fullscreen canvas
+  const [mobileControlsOpen, setMobileControlsOpen] = useState(false); // collapsible toggles in mobile header
 
   useEffect(() => {
     const onResize = () => setIsMobile(window.innerWidth < 900);
@@ -1432,18 +1434,34 @@ export default function App() {
   );
 
   // ---------- Render ----------
+  // Mobile header height — used to compute workspace height. Closed = compact bar only,
+  // open = compact bar + toggles strip below it.
+  const mobileHeaderHeight = mobileControlsOpen ? 92 : 48;
+
   return (
     <div className="font-body min-h-screen text-paceon-ink" style={{ background: BRAND.paper }}>
       {/* Top bar */}
       {isMobile ? (
         <div className="border-b" style={{ borderColor: BRAND.line, background: BRAND.white }}>
-          <div className="flex items-center justify-between px-3 py-2">
+          <button
+            onClick={() => setMobileControlsOpen(o => !o)}
+            className="w-full flex items-center justify-between px-3 py-2"
+            style={{ background: BRAND.white }}>
             {headerLogoBlock}
-            {exportStatus && <span className="text-[10px]" style={{ color: BRAND.olive }}>{exportStatus}</span>}
-          </div>
-          <div className="px-3 pb-2 overflow-x-auto scroll-thin">
-            {formatTogglesBlock}
-          </div>
+            <div className="flex items-center gap-2">
+              {exportStatus && <span className="text-[10px] truncate max-w-[120px]" style={{ color: BRAND.olive }}>{exportStatus}</span>}
+              <div className="flex items-center gap-1 px-2 py-1 font-display text-[10px] uppercase tracking-wider"
+                style={{ color: BRAND.muted, border: `1px solid ${BRAND.line}` }}>
+                {project.sport === 'cycling' ? 'CYC' : 'RUN'} · {FORMATS[project.format].label.split(' ')[1] || FORMATS[project.format].label}
+                {mobileControlsOpen ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+              </div>
+            </div>
+          </button>
+          {mobileControlsOpen && (
+            <div className="px-3 pb-2 overflow-x-auto scroll-thin border-t" style={{ borderColor: BRAND.line }}>
+              <div className="pt-2">{formatTogglesBlock}</div>
+            </div>
+          )}
         </div>
       ) : (
         <div className="border-b flex items-center justify-between px-5 py-3 flex-wrap gap-2" style={{ borderColor: BRAND.line, background: BRAND.white }}>
@@ -1457,16 +1475,21 @@ export default function App() {
 
       {/* Workspace */}
       {isMobile ? (
-        <div className="flex flex-col" style={{ height: 'calc(100vh - 96px)' }}>
-          {/* Canvas — fixed-height area, tap to zoom */}
-          <div className="flex items-center justify-center px-3 py-2 flex-shrink-0"
-            style={{ background: '#e8e5dc', height: 'min(60vh, 70vw * 16 / 9)' }}
+        <div className="flex flex-col" style={{ height: `calc(100vh - ${mobileHeaderHeight}px)` }}>
+          {/* Canvas — bounded container, canvas itself uses aspect-ratio to scale */}
+          <div className="flex items-center justify-center px-3 py-2 flex-shrink-0 cursor-pointer"
+            style={{ background: '#e8e5dc', height: 'min(38vh, 80vw)' }}
             onClick={() => setZoomed(true)}>
             <div className="relative bg-black"
               style={{
-                maxHeight: '100%', maxWidth: '100%',
                 aspectRatio: `${format.w} / ${format.h}`,
-                height: '100%',
+                maxHeight: '100%',
+                maxWidth: '100%',
+                // Lock height OR width depending on which dimension constrains us.
+                // Tall formats (story 9:16) → height-bound, width derived.
+                // Square/wide formats → width-bound, height derived.
+                height: format.h >= format.w ? '100%' : 'auto',
+                width:  format.h >= format.w ? 'auto'  : '100%',
                 boxShadow: '0 8px 24px rgba(0,0,0,0.18)',
               }}>
               {canvasElement}
