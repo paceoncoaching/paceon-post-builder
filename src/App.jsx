@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import {
   Plus, Trash2, ArrowUp, ArrowDown, Repeat, Image as ImageIcon, Video,
   Download, Save, FolderOpen, Sparkles, MessageSquare, Layers,
-  Bookmark, X, Copy, Eye, EyeOff, Move, Palette,
+  Bookmark, X, Copy, Eye, EyeOff, Move, Palette, FileText,
 } from 'lucide-react';
 
 /* =========================================================================
@@ -91,7 +91,19 @@ const DEFAULT_POSITIONS = {
   metricsY: 0,         // shift metrics row up/down
 };
 
-function rid() { return Math.random().toString(36).slice(2, 10); }
+// Robust unique ID — uses crypto.randomUUID where available, falls back to
+// timestamp + counter + random to guarantee uniqueness even in older runtimes.
+let _ridCounter = 0;
+function rid() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  _ridCounter = (_ridCounter + 1) % 1000000;
+  const t = Date.now().toString(36);
+  const c = _ridCounter.toString(36).padStart(4, '0');
+  const r = Math.random().toString(36).slice(2).padStart(8, '0').slice(0, 8);
+  return `${t}-${c}-${r}`;
+}
 function seg(label, duration, low, high) {
   return { id: rid(), type: 'segment', label, duration, intensityLow: low, intensityHigh: high };
 }
@@ -232,6 +244,20 @@ function fmtDuration(min) {
   const h = Math.floor(min / 60);
   const m = Math.round(min - h * 60);
   return m === 0 ? `${h}h` : `${h}h ${m}min`;
+}
+
+// Force any focused text input/textarea to blur, which fires its onBlur handler
+// and commits any debounced edit before the caller proceeds. Call this at the
+// start of any operation that reads or mutates project state in response to a
+// click — add/save/load/preset/etc — to prevent races between debounced commits
+// and other state updates.
+function flushPendingEdits() {
+  if (typeof document === 'undefined') return;
+  const el = document.activeElement;
+  if (el && typeof el.blur === 'function' &&
+      (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) {
+    el.blur();
+  }
 }
 
 function autoDraftDescription(title, segments, sport) {
@@ -766,6 +792,27 @@ export default function App() {
   const [draggingAnno, setDraggingAnno] = useState(null);
   const [bgFile, setBgFile] = useState(null);
 
+  // Responsive layout — mobile when viewport is narrow
+  const [isMobile, setIsMobile] = useState(() =>
+    typeof window !== 'undefined' && window.innerWidth < 900
+  );
+  const [zoomed, setZoomed] = useState(false); // mobile fullscreen canvas
+
+  useEffect(() => {
+    const onResize = () => setIsMobile(window.innerWidth < 900);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  // Lock body scroll when zoom modal is open so background doesn't scroll
+  useEffect(() => {
+    if (zoomed) {
+      const prev = document.body.style.overflow;
+      document.body.style.overflow = 'hidden';
+      return () => { document.body.style.overflow = prev; };
+    }
+  }, [zoomed]);
+
   // Logo images — kept in refs, separate from project state to survive save/load
   const bundledLogos = useRef({ white: null, black: null });
   const customLogo = useRef(null);
@@ -873,13 +920,15 @@ export default function App() {
     return { x: pad, y: graphTop, w: W - pad * 2, h: graphHeight };
   }, [format, project.title, project.layout, project.positions]);
 
-  const handleCanvasMouseDown = (e) => {
+  // Generic pointer handler — accepts clientX/clientY so it works for both mouse and touch
+  const handlePointerStart = (clientX, clientY) => {
     const c = canvasRef.current;
+    if (!c) return;
     const rect = c.getBoundingClientRect();
     const sx = c.width / rect.width;
     const sy = c.height / rect.height;
-    const x = (e.clientX - rect.left) * sx;
-    const y = (e.clientY - rect.top) * sy;
+    const x = (clientX - rect.left) * sx;
+    const y = (clientY - rect.top) * sy;
     const graphRect = getGraphRect();
 
     for (const a of project.annotations) {
@@ -904,23 +953,25 @@ export default function App() {
       const bubbleH = 220;
       if (Math.abs(x - noteX) < bubbleW / 2 && Math.abs(y - noteY) < bubbleH / 2) {
         setDraggingAnno({ id: a.id, mode: 'note' });
-        return;
+        return true;
       }
       if (a.targetMode !== 'segment' && Math.hypot(x - targetX, y - targetY) < 30) {
         setDraggingAnno({ id: a.id, mode: 'arrow' });
-        return;
+        return true;
       }
     }
+    return false;
   };
 
-  const handleCanvasMouseMove = (e) => {
+  const handlePointerMove = (clientX, clientY) => {
     if (!draggingAnno) return;
     const c = canvasRef.current;
+    if (!c) return;
     const rect = c.getBoundingClientRect();
     const sx = c.width / rect.width;
     const sy = c.height / rect.height;
-    const x = (e.clientX - rect.left) * sx;
-    const y = (e.clientY - rect.top) * sy;
+    const x = (clientX - rect.left) * sx;
+    const y = (clientY - rect.top) * sy;
     const graphRect = getGraphRect();
 
     setProject(p => ({
@@ -935,7 +986,29 @@ export default function App() {
     }));
   };
 
-  const handleCanvasMouseUp = () => setDraggingAnno(null);
+  const handlePointerEnd = () => setDraggingAnno(null);
+
+  // Mouse wrappers
+  const handleCanvasMouseDown = (e) => handlePointerStart(e.clientX, e.clientY);
+  const handleCanvasMouseMove = (e) => handlePointerMove(e.clientX, e.clientY);
+  const handleCanvasMouseUp = () => handlePointerEnd();
+
+  // Touch wrappers — preventDefault on touchmove during a drag stops the page from scrolling
+  const handleCanvasTouchStart = (e) => {
+    if (e.touches.length !== 1) return;
+    const t = e.touches[0];
+    const grabbed = handlePointerStart(t.clientX, t.clientY);
+    // Only swallow the gesture if we actually started a drag — otherwise let
+    // taps propagate to the tap-to-zoom handler on the wrapper element.
+    if (grabbed && e.cancelable) e.preventDefault();
+  };
+  const handleCanvasTouchMove = (e) => {
+    if (!draggingAnno || e.touches.length !== 1) return;
+    if (e.cancelable) e.preventDefault();
+    const t = e.touches[0];
+    handlePointerMove(t.clientX, t.clientY);
+  };
+  const handleCanvasTouchEnd = () => handlePointerEnd();
 
   // Operations
   const updateProject = (patch) => setProject(p => ({ ...p, ...patch }));
@@ -983,6 +1056,7 @@ export default function App() {
   }
 
   const loadPreset = (preset) => {
+    flushPendingEdits();
     setProject(p => ({
       ...p,
       title: preset.title,
@@ -993,6 +1067,7 @@ export default function App() {
   };
 
   const addAnnotation = (styleKey = 'science') => {
+    flushPendingEdits();
     const preset = ANNOTATION_PRESETS[styleKey];
     const a = migrateAnnotation({
       id: rid(),
@@ -1041,6 +1116,7 @@ export default function App() {
 
   // Save / Load — serialise everything except non-cloneable image objects
   const saveProject = () => {
+    flushPendingEdits();
     const name = prompt('Project name:');
     if (!name) return;
     try {
@@ -1097,6 +1173,7 @@ export default function App() {
   };
 
   const loadProject = (name) => {
+    flushPendingEdits();
     try {
       const all = JSON.parse(localStorage.getItem('paceon:projects') || '{}');
       const data = all[name];
@@ -1189,6 +1266,7 @@ export default function App() {
 
   // Export
   const exportImage = () => {
+    flushPendingEdits();
     setExportStatus('Rendering image...');
     canvasRef.current.toBlob((blob) => {
       const url = URL.createObjectURL(blob);
@@ -1203,6 +1281,7 @@ export default function App() {
   };
 
   const exportVideo = () => {
+    flushPendingEdits();
     const canvas = canvasRef.current;
     if (!canvas) return;
     setExportStatus(`Recording ${project.videoLoopLength}s loop...`);
@@ -1249,196 +1328,226 @@ export default function App() {
   const autoFillDescription = () => updateProject({ description: autoDraftDescription(project.title, project.segments, project.sport) });
   const autoFillCaption = () => updateProject({ caption: autoDraftCaption(project.title, project.segments, project.sport, project.description) });
 
+  // ---------- Subviews used by both desktop and mobile ----------
+  const headerLogoBlock = (
+    <div className="flex items-center gap-3">
+      <img src="/logos/paceon-black.svg" alt="PaceOn Coaching" className="h-7 w-auto sm:h-8" />
+      <span className="font-display text-[10px] sm:text-xs uppercase tracking-widest border-l pl-2 sm:pl-3"
+        style={{ color: BRAND.muted, borderColor: BRAND.line }}>Post Builder</span>
+    </div>
+  );
+
+  const formatTogglesBlock = (
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+      <Toggle label="Sport" options={['cycling', 'running']} value={project.sport} onChange={v => updateProject({ sport: v })} accent={BRAND.olive} />
+      <Toggle label="Format"
+        options={Object.keys(FORMATS)} getOptionLabel={k => FORMATS[k].label}
+        value={project.format} onChange={v => updateProject({ format: v })} accent={BRAND.ink} />
+      <Toggle label="Layout"
+        options={Object.keys(LAYOUTS)} getOptionLabel={k => LAYOUTS[k].label}
+        value={project.layout} onChange={v => updateProject({ layout: v })} accent={BRAND.ink} />
+    </div>
+  );
+
+  const desktopExportButtons = (
+    <div className="flex items-center gap-2">
+      {exportStatus && <span className="text-xs" style={{ color: BRAND.olive }}>{exportStatus}</span>}
+      <button onClick={saveProject}
+        className="font-display flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold uppercase tracking-wider"
+        style={{ border: `1px solid ${BRAND.line}` }}>
+        <Save size={13} /> Save
+      </button>
+      <button onClick={exportImage}
+        className="font-display flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-white"
+        style={{ background: BRAND.ink }}>
+        <Download size={13} /> Image
+      </button>
+      <button onClick={exportVideo}
+        className="font-display flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-white"
+        style={{ background: BRAND.orange }}>
+        <Video size={13} /> Video
+      </button>
+    </div>
+  );
+
+  // Tab definitions — share between desktop and mobile, with mobile getting two extra tabs
+  const baseTabs = [
+    { k: 'build',      l: 'Build',   i: <Layers size={13} /> },
+    { k: 'style',      l: 'Style',   i: <Sparkles size={13} /> },
+    { k: 'background', l: 'BG',      i: <ImageIcon size={13} /> },
+    { k: 'annotate',   l: 'Notes',   i: <MessageSquare size={13} /> },
+    { k: 'layout',     l: 'Layout',  i: <Move size={13} /> },
+    { k: 'presets',    l: 'Presets', i: <Bookmark size={13} /> },
+  ];
+  const mobileExtraTabs = [
+    { k: 'content',    l: 'Content', i: <FileText size={13} /> },
+    { k: 'export',     l: 'Export',  i: <Download size={13} /> },
+  ];
+  const tabs = isMobile ? [...baseTabs, ...mobileExtraTabs] : baseTabs;
+
+  const renderActivePanel = () => {
+    switch (activeTab) {
+      case 'build':      return <BuildPanel project={project} addSegment={addSegment} addRepeat={addRepeat} updateSegment={updateSegment} removeSegment={removeSegment} moveSegment={moveSegment} />;
+      case 'style':      return <StylePanel project={project} updateProject={updateProject} handleLogoUpload={handleLogoUpload} resetLogo={resetLogo} />;
+      case 'background': return <BackgroundPanel project={project} updateProject={updateProject} bgFile={bgFile} setBgFile={setBgFile} handleBackgroundUpload={handleBackgroundUpload} />;
+      case 'annotate':   return <AnnotatePanel project={project} flat={flat} addAnnotation={addAnnotation} updateAnnotation={updateAnnotation} removeAnnotation={removeAnnotation} resetAnnotationStyle={resetAnnotationStyle} />;
+      case 'layout':     return <LayoutPanel project={project} updateProject={updateProject} />;
+      case 'presets':    return <PresetsPanel project={project} loadPreset={loadPreset} savedProjects={savedProjects} loadProject={loadProject} deleteProject={deleteProject} />;
+      case 'content':    return <ContentPanel project={project} updateProject={updateProject} metrics={metrics} autoFillDescription={autoFillDescription} autoFillCaption={autoFillCaption} />;
+      case 'export':     return <ExportPanel project={project} updateProject={updateProject} saveProject={saveProject} exportImage={exportImage} exportVideo={exportVideo} exportStatus={exportStatus} />;
+      default:           return null;
+    }
+  };
+
+  // Canvas wrapper — same JSX for desktop and mobile, parent decides sizing
+  const canvasElement = (
+    <canvas ref={canvasRef}
+      width={format.w} height={format.h}
+      onMouseDown={handleCanvasMouseDown}
+      onMouseMove={handleCanvasMouseMove}
+      onMouseUp={handleCanvasMouseUp}
+      onMouseLeave={handleCanvasMouseUp}
+      onTouchStart={handleCanvasTouchStart}
+      onTouchMove={handleCanvasTouchMove}
+      onTouchEnd={handleCanvasTouchEnd}
+      onTouchCancel={handleCanvasTouchEnd}
+      style={{ width: '100%', height: '100%', display: 'block', cursor: draggingAnno ? 'grabbing' : 'default', touchAction: 'none' }} />
+  );
+
+  const tabsBar = (
+    <div className="flex border-b flex-wrap" style={{ borderColor: BRAND.line }}>
+      {tabs.map(t => (
+        <button key={t.k} onClick={() => setActiveTab(t.k)}
+          className="font-display flex-1 flex items-center justify-center gap-1 py-2 text-[10px] font-semibold uppercase tracking-wider"
+          style={{
+            borderBottom: `2px solid ${activeTab === t.k ? BRAND.orange : 'transparent'}`,
+            color: activeTab === t.k ? BRAND.ink : BRAND.muted,
+            background: activeTab === t.k ? BRAND.white : 'transparent',
+            minWidth: 56,
+          }}>
+          {t.i} {t.l}
+        </button>
+      ))}
+    </div>
+  );
+
+  // ---------- Render ----------
   return (
     <div className="font-body min-h-screen text-paceon-ink" style={{ background: BRAND.paper }}>
       {/* Top bar */}
-      <div className="border-b flex items-center justify-between px-5 py-3 flex-wrap gap-2" style={{ borderColor: BRAND.line, background: BRAND.white }}>
-        <div className="flex items-center gap-6 flex-wrap">
-          <div className="flex items-center gap-3">
-            <img src="/logos/paceon-black.svg" alt="PaceOn Coaching" className="h-8 w-auto" />
-            <span className="font-display text-xs uppercase tracking-widest border-l pl-3"
-              style={{ color: BRAND.muted, borderColor: BRAND.line }}>Post Builder</span>
+      {isMobile ? (
+        <div className="border-b" style={{ borderColor: BRAND.line, background: BRAND.white }}>
+          <div className="flex items-center justify-between px-3 py-2">
+            {headerLogoBlock}
+            {exportStatus && <span className="text-[10px]" style={{ color: BRAND.olive }}>{exportStatus}</span>}
           </div>
-
-          <Toggle label="Sport" options={['cycling', 'running']} value={project.sport} onChange={v => updateProject({ sport: v })} accent={BRAND.olive} />
-
-          <Toggle label="Format"
-            options={Object.keys(FORMATS)}
-            getOptionLabel={k => FORMATS[k].label}
-            value={project.format} onChange={v => updateProject({ format: v })} accent={BRAND.ink} />
-
-          <Toggle label="Layout"
-            options={Object.keys(LAYOUTS)}
-            getOptionLabel={k => LAYOUTS[k].label}
-            value={project.layout} onChange={v => updateProject({ layout: v })} accent={BRAND.ink} />
+          <div className="px-3 pb-2 overflow-x-auto scroll-thin">
+            {formatTogglesBlock}
+          </div>
         </div>
-
-        <div className="flex items-center gap-2">
-          {exportStatus && <span className="text-xs" style={{ color: BRAND.olive }}>{exportStatus}</span>}
-          <button onClick={saveProject}
-            className="font-display flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold uppercase tracking-wider"
-            style={{ border: `1px solid ${BRAND.line}` }}>
-            <Save size={13} /> Save
-          </button>
-          <button onClick={exportImage}
-            className="font-display flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-white"
-            style={{ background: BRAND.ink }}>
-            <Download size={13} /> Image
-          </button>
-          <button onClick={exportVideo}
-            className="font-display flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-white"
-            style={{ background: BRAND.orange }}>
-            <Video size={13} /> Video
-          </button>
+      ) : (
+        <div className="border-b flex items-center justify-between px-5 py-3 flex-wrap gap-2" style={{ borderColor: BRAND.line, background: BRAND.white }}>
+          <div className="flex items-center gap-6 flex-wrap">
+            {headerLogoBlock}
+            {formatTogglesBlock}
+          </div>
+          {desktopExportButtons}
         </div>
-      </div>
+      )}
 
       {/* Workspace */}
-      <div className="grid" style={{ gridTemplateColumns: '400px 1fr 320px', height: 'calc(100vh - 56px)' }}>
-        {/* LEFT */}
-        <div className="flex flex-col border-r" style={{ borderColor: BRAND.line, background: BRAND.panel }}>
-          <div className="flex border-b flex-wrap" style={{ borderColor: BRAND.line }}>
-            {[
-              { k: 'build',      l: 'Build',   i: <Layers size={13} /> },
-              { k: 'style',      l: 'Style',   i: <Sparkles size={13} /> },
-              { k: 'background', l: 'BG',      i: <ImageIcon size={13} /> },
-              { k: 'annotate',   l: 'Notes',   i: <MessageSquare size={13} /> },
-              { k: 'layout',     l: 'Layout',  i: <Move size={13} /> },
-              { k: 'presets',    l: 'Presets', i: <Bookmark size={13} /> },
-            ].map(t => (
-              <button key={t.k} onClick={() => setActiveTab(t.k)}
-                className="font-display flex-1 flex items-center justify-center gap-1 py-2 text-[10px] font-semibold uppercase tracking-wider"
-                style={{
-                  borderBottom: `2px solid ${activeTab === t.k ? BRAND.orange : 'transparent'}`,
-                  color: activeTab === t.k ? BRAND.ink : BRAND.muted,
-                  background: activeTab === t.k ? BRAND.white : 'transparent',
-                  minWidth: 56,
-                }}>
-                {t.i} {t.l}
-              </button>
-            ))}
-          </div>
-
-          <div className="flex-1 overflow-y-auto scroll-thin p-4">
-            {activeTab === 'build' && (
-              <BuildPanel project={project} addSegment={addSegment} addRepeat={addRepeat}
-                updateSegment={updateSegment} removeSegment={removeSegment} moveSegment={moveSegment} />
-            )}
-            {activeTab === 'style' && (
-              <StylePanel project={project} updateProject={updateProject}
-                handleLogoUpload={handleLogoUpload} resetLogo={resetLogo} />
-            )}
-            {activeTab === 'background' && (
-              <BackgroundPanel project={project} updateProject={updateProject} bgFile={bgFile} setBgFile={setBgFile}
-                handleBackgroundUpload={handleBackgroundUpload} />
-            )}
-            {activeTab === 'annotate' && (
-              <AnnotatePanel project={project} flat={flat} addAnnotation={addAnnotation}
-                updateAnnotation={updateAnnotation} removeAnnotation={removeAnnotation}
-                resetAnnotationStyle={resetAnnotationStyle} />
-            )}
-            {activeTab === 'layout' && (
-              <LayoutPanel project={project} updateProject={updateProject} />
-            )}
-            {activeTab === 'presets' && (
-              <PresetsPanel project={project} loadPreset={loadPreset} savedProjects={savedProjects}
-                loadProject={loadProject} deleteProject={deleteProject} />
-            )}
-          </div>
-        </div>
-
-        {/* CENTER */}
-        <div className="flex flex-col items-center justify-center p-6" style={{ background: '#e8e5dc' }}>
-          <div className="relative bg-black"
-            style={{
-              maxHeight: '100%', maxWidth: '100%',
-              aspectRatio: `${format.w} / ${format.h}`,
-              height: 'calc(100vh - 120px)',
-              boxShadow: '0 20px 60px rgba(0,0,0,0.18), 0 4px 12px rgba(0,0,0,0.08)',
-            }}>
-            <canvas ref={canvasRef}
-              width={format.w} height={format.h}
-              onMouseDown={handleCanvasMouseDown}
-              onMouseMove={handleCanvasMouseMove}
-              onMouseUp={handleCanvasMouseUp}
-              onMouseLeave={handleCanvasMouseUp}
-              style={{ width: '100%', height: '100%', display: 'block', cursor: draggingAnno ? 'grabbing' : 'default' }} />
-          </div>
-          <div className="mt-3 text-xs font-display uppercase tracking-widest" style={{ color: BRAND.muted }}>
-            {format.w} × {format.h}px · {format.label} · drag note bubbles to reposition
-          </div>
-        </div>
-
-        {/* RIGHT */}
-        <div className="flex flex-col border-l overflow-y-auto scroll-thin" style={{ borderColor: BRAND.line, background: BRAND.panel }}>
-          <div className="p-4 border-b" style={{ borderColor: BRAND.line }}>
-            <div className="font-display text-xs font-bold uppercase tracking-widest mb-3" style={{ color: BRAND.muted }}>Session Metrics</div>
-            <div className="grid grid-cols-3 gap-2">
-              <Metric label="Duration" value={fmtDuration(metrics.totalMin)} />
-              <Metric label={project.sport === 'cycling' ? 'IF' : 'rIF'} value={`${metrics.ifLow.toFixed(2)}–${metrics.ifHigh.toFixed(2)}`} />
-              <Metric label={project.sport === 'cycling' ? 'TSS' : 'rTSS'} value={`${Math.round(metrics.tssLow)}–${Math.round(metrics.tssHigh)}`} />
-            </div>
-            <div className="text-[10px] mt-2" style={{ color: BRAND.muted }}>
-              Ranges reflect the low–high intensity of each segment.
+      {isMobile ? (
+        <div className="flex flex-col" style={{ height: 'calc(100vh - 96px)' }}>
+          {/* Canvas — fixed-height area, tap to zoom */}
+          <div className="flex items-center justify-center px-3 py-2 flex-shrink-0"
+            style={{ background: '#e8e5dc', height: 'min(60vh, 70vw * 16 / 9)' }}
+            onClick={() => setZoomed(true)}>
+            <div className="relative bg-black"
+              style={{
+                maxHeight: '100%', maxWidth: '100%',
+                aspectRatio: `${format.w} / ${format.h}`,
+                height: '100%',
+                boxShadow: '0 8px 24px rgba(0,0,0,0.18)',
+              }}>
+              {canvasElement}
             </div>
           </div>
 
-          <div className="p-4 border-b" style={{ borderColor: BRAND.line }}>
-            <label className="font-display text-xs font-bold uppercase tracking-widest mb-2 block" style={{ color: BRAND.muted }}>Title</label>
-            <DebouncedInput value={project.title} onCommit={v => updateProject({ title: v })}
-              className="w-full px-3 py-2 text-sm border" style={{ borderColor: BRAND.line, background: BRAND.white }} />
-          </div>
-
-          <div className="p-4 border-b" style={{ borderColor: BRAND.line }}>
-            <div className="flex items-center justify-between mb-2">
-              <label className="font-display text-xs font-bold uppercase tracking-widest" style={{ color: BRAND.muted }}>Description</label>
-              <button onClick={autoFillDescription} className="font-display flex items-center gap-1 text-[10px] uppercase tracking-wider font-semibold" style={{ color: BRAND.orange }}>
-                <Sparkles size={10} /> Auto-draft
-              </button>
+          {/* Tab bar + content */}
+          <div className="flex-1 flex flex-col overflow-hidden" style={{ background: BRAND.panel }}>
+            <div className="overflow-x-auto scroll-thin flex-shrink-0" style={{ background: BRAND.panel }}>
+              <div style={{ minWidth: 'max-content' }}>{tabsBar}</div>
             </div>
-            <DebouncedTextarea value={project.description} onCommit={v => updateProject({ description: v })} rows={5}
-              className="w-full px-3 py-2 text-sm border" style={{ borderColor: BRAND.line, background: BRAND.white, resize: 'vertical' }} />
-          </div>
-
-          <div className="p-4 border-b" style={{ borderColor: BRAND.line }}>
-            <div className="flex items-center justify-between mb-2">
-              <label className="font-display text-xs font-bold uppercase tracking-widest" style={{ color: BRAND.muted }}>Instagram Caption</label>
-              <button onClick={autoFillCaption} className="font-display flex items-center gap-1 text-[10px] uppercase tracking-wider font-semibold" style={{ color: BRAND.orange }}>
-                <Sparkles size={10} /> Auto-draft
-              </button>
-            </div>
-            <DebouncedTextarea value={project.caption} onCommit={v => updateProject({ caption: v })} rows={8}
-              className="w-full px-3 py-2 text-xs border font-mono" style={{ borderColor: BRAND.line, background: BRAND.white, resize: 'vertical' }} />
-            {project.caption && (
-              <button onClick={() => navigator.clipboard.writeText(project.caption)}
-                className="font-display mt-2 flex items-center gap-1 text-[10px] uppercase tracking-wider font-semibold"
-                style={{ color: BRAND.olive }}>
-                <Copy size={10} /> Copy caption
-              </button>
-            )}
-          </div>
-
-          <div className="p-4">
-            <div className="font-display text-xs font-bold uppercase tracking-widest mb-3" style={{ color: BRAND.muted }}>Video Loop</div>
-            <div className="flex gap-1.5">
-              {[5, 10, 15].map(s => (
-                <button key={s} onClick={() => updateProject({ videoLoopLength: s })}
-                  className="font-display flex-1 py-2 text-xs font-semibold uppercase tracking-wider"
-                  style={{
-                    background: project.videoLoopLength === s ? BRAND.ink : BRAND.white,
-                    color: project.videoLoopLength === s ? BRAND.white : BRAND.ink,
-                    border: `1px solid ${BRAND.line}`,
-                  }}>
-                  {s}s
-                </button>
-              ))}
-            </div>
-            <div className="text-[10px] mt-3 leading-relaxed" style={{ color: BRAND.muted }}>
-              Modern Chrome/Edge exports MP4 directly. Other browsers fall back to WebM — convert to MP4 (CloudConvert / HandBrake) for guaranteed Instagram compatibility.
+            <div className="flex-1 overflow-y-auto scroll-thin p-4">
+              {renderActivePanel()}
             </div>
           </div>
         </div>
-      </div>
+      ) : (
+        <div className="grid" style={{ gridTemplateColumns: '400px 1fr 320px', height: 'calc(100vh - 56px)' }}>
+          {/* LEFT — tabs + active panel */}
+          <div className="flex flex-col border-r" style={{ borderColor: BRAND.line, background: BRAND.panel }}>
+            {tabsBar}
+            <div className="flex-1 overflow-y-auto scroll-thin p-4">
+              {renderActivePanel()}
+            </div>
+          </div>
+
+          {/* CENTER — canvas */}
+          <div className="flex flex-col items-center justify-center p-6" style={{ background: '#e8e5dc' }}>
+            <div className="relative bg-black"
+              style={{
+                maxHeight: '100%', maxWidth: '100%',
+                aspectRatio: `${format.w} / ${format.h}`,
+                height: 'calc(100vh - 120px)',
+                boxShadow: '0 20px 60px rgba(0,0,0,0.18), 0 4px 12px rgba(0,0,0,0.08)',
+              }}>
+              {canvasElement}
+            </div>
+            <div className="mt-3 text-xs font-display uppercase tracking-widest" style={{ color: BRAND.muted }}>
+              {format.w} × {format.h}px · {format.label} · drag note bubbles to reposition
+            </div>
+          </div>
+
+          {/* RIGHT — content sidebar */}
+          <div className="flex flex-col border-l overflow-y-auto scroll-thin" style={{ borderColor: BRAND.line, background: BRAND.panel }}>
+            <ContentPanel project={project} updateProject={updateProject} metrics={metrics}
+              autoFillDescription={autoFillDescription} autoFillCaption={autoFillCaption}
+              embedded={true} />
+          </div>
+        </div>
+      )}
+
+      {/* Zoomed canvas modal — mobile only */}
+      {zoomed && isMobile && (
+        <div className="fixed inset-0 z-50 flex flex-col" style={{ background: 'rgba(10,10,10,0.95)' }}
+          onClick={() => setZoomed(false)}>
+          <div className="flex justify-between items-center px-4 py-3 flex-shrink-0">
+            <div className="font-display text-[10px] uppercase tracking-widest text-white opacity-70">
+              {format.label} · {format.w}×{format.h}
+            </div>
+            <button onClick={(e) => { e.stopPropagation(); setZoomed(false); }}
+              className="text-white opacity-80 p-2">
+              <X size={20} />
+            </button>
+          </div>
+          <div className="flex-1 flex items-center justify-center p-2" onClick={(e) => e.stopPropagation()}>
+            <div className="relative bg-black"
+              style={{
+                maxHeight: '100%', maxWidth: '100%',
+                aspectRatio: `${format.w} / ${format.h}`,
+                height: '100%',
+              }}>
+              {canvasElement}
+            </div>
+          </div>
+          <div className="text-center px-4 py-2 flex-shrink-0">
+            <div className="font-display text-[10px] uppercase tracking-widest text-white opacity-50">
+              Tap outside the post to close · drag notes to reposition
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -2079,6 +2188,118 @@ function LayoutPanel({ project, updateProject }) {
 
       <div className="p-2 text-[10px] leading-relaxed" style={{ background: BRAND.white, border: `1px solid ${BRAND.line}`, color: BRAND.muted }}>
         <strong className="font-display uppercase tracking-wider" style={{ color: BRAND.ink }}>Tip:</strong> if annotations are covering the graph, push the graph down (positive value) or shrink the description area to make room.
+      </div>
+    </div>
+  );
+}
+
+/* ContentPanel — title, description, caption, metrics.
+   Used as the right sidebar on desktop (embedded=true → no outer padding/wrapping)
+   and as the "Content" tab on mobile (embedded=false → tab-style spacing). */
+function ContentPanel({ project, updateProject, metrics, autoFillDescription, autoFillCaption, embedded = false }) {
+  const sectionClass = embedded ? "p-4 border-b" : "pb-4 border-b mb-4";
+  return (
+    <div className={embedded ? "" : "space-y-0"}>
+      <div className={sectionClass} style={{ borderColor: BRAND.line }}>
+        <div className="font-display text-xs font-bold uppercase tracking-widest mb-3" style={{ color: BRAND.muted }}>Session Metrics</div>
+        <div className="grid grid-cols-3 gap-2">
+          <Metric label="Duration" value={fmtDuration(metrics.totalMin)} />
+          <Metric label={project.sport === 'cycling' ? 'IF' : 'rIF'} value={`${metrics.ifLow.toFixed(2)}–${metrics.ifHigh.toFixed(2)}`} />
+          <Metric label={project.sport === 'cycling' ? 'TSS' : 'rTSS'} value={`${Math.round(metrics.tssLow)}–${Math.round(metrics.tssHigh)}`} />
+        </div>
+        <div className="text-[10px] mt-2" style={{ color: BRAND.muted }}>
+          Ranges reflect the low–high intensity of each segment.
+        </div>
+      </div>
+
+      <div className={sectionClass} style={{ borderColor: BRAND.line }}>
+        <label className="font-display text-xs font-bold uppercase tracking-widest mb-2 block" style={{ color: BRAND.muted }}>Title</label>
+        <DebouncedInput value={project.title} onCommit={v => updateProject({ title: v })}
+          className="w-full px-3 py-2 text-sm border" style={{ borderColor: BRAND.line, background: BRAND.white }} />
+      </div>
+
+      <div className={sectionClass} style={{ borderColor: BRAND.line }}>
+        <div className="flex items-center justify-between mb-2">
+          <label className="font-display text-xs font-bold uppercase tracking-widest" style={{ color: BRAND.muted }}>Description</label>
+          <button onClick={autoFillDescription} className="font-display flex items-center gap-1 text-[10px] uppercase tracking-wider font-semibold" style={{ color: BRAND.orange }}>
+            <Sparkles size={10} /> Auto-draft
+          </button>
+        </div>
+        <DebouncedTextarea value={project.description} onCommit={v => updateProject({ description: v })} rows={5}
+          className="w-full px-3 py-2 text-sm border" style={{ borderColor: BRAND.line, background: BRAND.white, resize: 'vertical' }} />
+      </div>
+
+      <div className={embedded ? "p-4" : ""}>
+        <div className="flex items-center justify-between mb-2">
+          <label className="font-display text-xs font-bold uppercase tracking-widest" style={{ color: BRAND.muted }}>Instagram Caption</label>
+          <button onClick={autoFillCaption} className="font-display flex items-center gap-1 text-[10px] uppercase tracking-wider font-semibold" style={{ color: BRAND.orange }}>
+            <Sparkles size={10} /> Auto-draft
+          </button>
+        </div>
+        <DebouncedTextarea value={project.caption} onCommit={v => updateProject({ caption: v })} rows={8}
+          className="w-full px-3 py-2 text-xs border font-mono" style={{ borderColor: BRAND.line, background: BRAND.white, resize: 'vertical' }} />
+        {project.caption && (
+          <button onClick={() => navigator.clipboard.writeText(project.caption)}
+            className="font-display mt-2 flex items-center gap-1 text-[10px] uppercase tracking-wider font-semibold"
+            style={{ color: BRAND.olive }}>
+            <Copy size={10} /> Copy caption
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ExportPanel — mobile-only "Export" tab containing Save / Image / Video buttons
+   plus the video loop length picker. On desktop the same actions live in the top bar. */
+function ExportPanel({ project, updateProject, saveProject, exportImage, exportVideo, exportStatus }) {
+  return (
+    <div className="space-y-5">
+      <div>
+        <div className="font-display text-xs font-bold uppercase tracking-widest mb-2" style={{ color: BRAND.muted }}>Export</div>
+        <div className="space-y-2">
+          <button onClick={exportImage}
+            className="font-display w-full flex items-center justify-center gap-2 py-3 text-sm font-semibold uppercase tracking-wider text-white"
+            style={{ background: BRAND.ink }}>
+            <Download size={15} /> Export image (PNG)
+          </button>
+          <button onClick={exportVideo}
+            className="font-display w-full flex items-center justify-center gap-2 py-3 text-sm font-semibold uppercase tracking-wider text-white"
+            style={{ background: BRAND.orange }}>
+            <Video size={15} /> Export video ({project.videoLoopLength}s loop)
+          </button>
+          <button onClick={saveProject}
+            className="font-display w-full flex items-center justify-center gap-2 py-3 text-sm font-semibold uppercase tracking-wider"
+            style={{ background: BRAND.white, border: `1px solid ${BRAND.line}` }}>
+            <Save size={15} /> Save project
+          </button>
+        </div>
+        {exportStatus && (
+          <div className="text-[11px] mt-2 p-2" style={{ background: BRAND.white, color: BRAND.olive, border: `1px solid ${BRAND.line}` }}>
+            {exportStatus}
+          </div>
+        )}
+      </div>
+
+      <div>
+        <div className="font-display text-xs font-bold uppercase tracking-widest mb-3" style={{ color: BRAND.muted }}>Video Loop Length</div>
+        <div className="flex gap-1.5">
+          {[5, 10, 15].map(s => (
+            <button key={s} onClick={() => updateProject({ videoLoopLength: s })}
+              className="font-display flex-1 py-2 text-xs font-semibold uppercase tracking-wider"
+              style={{
+                background: project.videoLoopLength === s ? BRAND.ink : BRAND.white,
+                color: project.videoLoopLength === s ? BRAND.white : BRAND.ink,
+                border: `1px solid ${BRAND.line}`,
+              }}>
+              {s}s
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="text-[10px] leading-relaxed p-2" style={{ background: BRAND.white, border: `1px solid ${BRAND.line}`, color: BRAND.muted }}>
+        Modern Chrome/Edge exports MP4 directly. Other browsers fall back to WebM — convert to MP4 (CloudConvert / HandBrake) for guaranteed Instagram compatibility.
       </div>
     </div>
   );
