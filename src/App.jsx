@@ -1221,6 +1221,53 @@ export default function App() {
     } catch (e) {}
   };
 
+  // Export all saved projects as a JSON file — useful for moving them between
+  // devices since localStorage is per-browser-per-origin.
+  const exportProjects = () => {
+    try {
+      const all = localStorage.getItem('paceon:projects') || '{}';
+      const blob = new Blob([all], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `paceon-projects-${Date.now()}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      setExportStatus('Projects exported');
+      setTimeout(() => setExportStatus(''), 2000);
+    } catch (e) {
+      setExportStatus('Export failed');
+    }
+  };
+
+  const importProjects = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const incoming = JSON.parse(reader.result);
+        if (typeof incoming !== 'object' || Array.isArray(incoming)) {
+          setExportStatus('Invalid project file');
+          return;
+        }
+        const existing = JSON.parse(localStorage.getItem('paceon:projects') || '{}');
+        const merged = { ...existing, ...incoming };
+        localStorage.setItem('paceon:projects', JSON.stringify(merged));
+        setSavedProjects(Object.keys(merged));
+        const added = Object.keys(incoming).length;
+        setExportStatus(`Imported ${added} project${added === 1 ? '' : 's'}`);
+        setTimeout(() => setExportStatus(''), 3000);
+      } catch (err) {
+        setExportStatus('Import failed — bad file');
+        setTimeout(() => setExportStatus(''), 3000);
+      }
+    };
+    reader.readAsText(file);
+    // Reset the input so the same file can be selected again later
+    e.target.value = '';
+  };
+
   // Uploads
   const handleBackgroundUpload = (e) => {
     const file = e.target.files?.[0];
@@ -1394,7 +1441,7 @@ export default function App() {
       case 'background': return <BackgroundPanel project={project} updateProject={updateProject} bgFile={bgFile} setBgFile={setBgFile} handleBackgroundUpload={handleBackgroundUpload} />;
       case 'annotate':   return <AnnotatePanel project={project} flat={flat} addAnnotation={addAnnotation} updateAnnotation={updateAnnotation} removeAnnotation={removeAnnotation} resetAnnotationStyle={resetAnnotationStyle} />;
       case 'layout':     return <LayoutPanel project={project} updateProject={updateProject} />;
-      case 'presets':    return <PresetsPanel project={project} loadPreset={loadPreset} savedProjects={savedProjects} loadProject={loadProject} deleteProject={deleteProject} />;
+      case 'presets':    return <PresetsPanel project={project} loadPreset={loadPreset} savedProjects={savedProjects} loadProject={loadProject} deleteProject={deleteProject} exportProjects={exportProjects} importProjects={importProjects} />;
       case 'content':    return <ContentPanel project={project} updateProject={updateProject} metrics={metrics} autoFillDescription={autoFillDescription} autoFillCaption={autoFillCaption} />;
       case 'export':     return <ExportPanel project={project} updateProject={updateProject} saveProject={saveProject} exportImage={exportImage} exportVideo={exportVideo} exportStatus={exportStatus} />;
       default:           return null;
@@ -1402,19 +1449,28 @@ export default function App() {
   };
 
   // Canvas wrapper — same JSX for desktop and mobile, parent decides sizing
-  const canvasElement = (
-    <canvas ref={canvasRef}
-      width={format.w} height={format.h}
-      onMouseDown={handleCanvasMouseDown}
-      onMouseMove={handleCanvasMouseMove}
-      onMouseUp={handleCanvasMouseUp}
-      onMouseLeave={handleCanvasMouseUp}
-      onTouchStart={handleCanvasTouchStart}
-      onTouchMove={handleCanvasTouchMove}
-      onTouchEnd={handleCanvasTouchEnd}
-      onTouchCancel={handleCanvasTouchEnd}
-      style={{ width: '100%', height: '100%', display: 'block', cursor: draggingAnno ? 'grabbing' : 'default', touchAction: 'none' }} />
-  );
+  // The canvas DOM node — referenced by mouse/touch handlers and the render loop.
+  // Use a callback ref so we always have the latest mounted canvas regardless of
+  // which layout branch (desktop, mobile, or zoom overlay) renders it.
+  const setCanvasNode = useCallback((node) => {
+    canvasRef.current = node;
+  }, []);
+
+  // Common props for the canvas tag — used in whichever layout branch renders it.
+  const canvasProps = {
+    ref: setCanvasNode,
+    width: format.w,
+    height: format.h,
+    onMouseDown: handleCanvasMouseDown,
+    onMouseMove: handleCanvasMouseMove,
+    onMouseUp: handleCanvasMouseUp,
+    onMouseLeave: handleCanvasMouseUp,
+    onTouchStart: handleCanvasTouchStart,
+    onTouchMove: handleCanvasTouchMove,
+    onTouchEnd: handleCanvasTouchEnd,
+    onTouchCancel: handleCanvasTouchEnd,
+    style: { width: '100%', height: '100%', display: 'block', cursor: draggingAnno ? 'grabbing' : 'default', touchAction: 'none' },
+  };
 
   const tabsBar = (
     <div className="flex border-b flex-wrap" style={{ borderColor: BRAND.line }}>
@@ -1476,25 +1532,55 @@ export default function App() {
       {/* Workspace */}
       {isMobile ? (
         <div className="flex flex-col" style={{ height: `calc(100vh - ${mobileHeaderHeight}px)` }}>
-          {/* Canvas — bounded container, canvas itself uses aspect-ratio to scale */}
-          <div className="flex items-center justify-center px-3 py-2 flex-shrink-0 cursor-pointer"
-            style={{ background: '#e8e5dc', height: 'min(38vh, 80vw)' }}
-            onClick={() => setZoomed(true)}>
-            <div className="relative bg-black"
-              style={{
-                aspectRatio: `${format.w} / ${format.h}`,
-                maxHeight: '100%',
-                maxWidth: '100%',
-                // Lock height OR width depending on which dimension constrains us.
-                // Tall formats (story 9:16) → height-bound, width derived.
-                // Square/wide formats → width-bound, height derived.
-                height: format.h >= format.w ? '100%' : 'auto',
-                width:  format.h >= format.w ? 'auto'  : '100%',
-                boxShadow: '0 8px 24px rgba(0,0,0,0.18)',
-              }}>
-              {canvasElement}
+          {/* Canvas — renders inline normally, becomes fullscreen overlay when zoomed.
+              Either way it's the SAME DOM node, so the ref stays valid and the
+              render loop keeps drawing without a remount. */}
+          {zoomed ? (
+            <div className="fixed inset-0 z-50 flex flex-col" style={{ background: 'rgba(10,10,10,0.95)' }}
+              onClick={() => setZoomed(false)}>
+              <div className="flex justify-between items-center px-4 py-3 flex-shrink-0">
+                <div className="font-display text-[10px] uppercase tracking-widest text-white opacity-70">
+                  {format.label} · {format.w}×{format.h}
+                </div>
+                <button onClick={(e) => { e.stopPropagation(); setZoomed(false); }}
+                  className="text-white opacity-80 p-2">
+                  <X size={20} />
+                </button>
+              </div>
+              <div className="flex-1 flex items-center justify-center p-2" onClick={(e) => e.stopPropagation()}>
+                <div className="relative bg-black"
+                  style={{
+                    aspectRatio: `${format.w} / ${format.h}`,
+                    maxHeight: '100%', maxWidth: '100%',
+                    height: format.h >= format.w ? '100%' : 'auto',
+                    width:  format.h >= format.w ? 'auto'  : '100%',
+                  }}>
+                  <canvas {...canvasProps} />
+                </div>
+              </div>
+              <div className="text-center px-4 py-2 flex-shrink-0">
+                <div className="font-display text-[10px] uppercase tracking-widest text-white opacity-50">
+                  Tap outside the post to close · drag notes to reposition
+                </div>
+              </div>
             </div>
-          </div>
+          ) : (
+            <div className="flex items-center justify-center px-3 py-2 flex-shrink-0 cursor-pointer"
+              style={{ background: '#e8e5dc', height: 'min(38vh, 80vw)' }}
+              onClick={() => setZoomed(true)}>
+              <div className="relative bg-black"
+                style={{
+                  aspectRatio: `${format.w} / ${format.h}`,
+                  maxHeight: '100%',
+                  maxWidth: '100%',
+                  height: format.h >= format.w ? '100%' : 'auto',
+                  width:  format.h >= format.w ? 'auto'  : '100%',
+                  boxShadow: '0 8px 24px rgba(0,0,0,0.18)',
+                }}>
+                <canvas {...canvasProps} />
+              </div>
+            </div>
+          )}
 
           {/* Tab bar + content */}
           <div className="flex-1 flex flex-col overflow-hidden" style={{ background: BRAND.panel }}>
@@ -1525,7 +1611,7 @@ export default function App() {
                 height: 'calc(100vh - 120px)',
                 boxShadow: '0 20px 60px rgba(0,0,0,0.18), 0 4px 12px rgba(0,0,0,0.08)',
               }}>
-              {canvasElement}
+              <canvas {...canvasProps} />
             </div>
             <div className="mt-3 text-xs font-display uppercase tracking-widest" style={{ color: BRAND.muted }}>
               {format.w} × {format.h}px · {format.label} · drag note bubbles to reposition
@@ -1537,37 +1623,6 @@ export default function App() {
             <ContentPanel project={project} updateProject={updateProject} metrics={metrics}
               autoFillDescription={autoFillDescription} autoFillCaption={autoFillCaption}
               embedded={true} />
-          </div>
-        </div>
-      )}
-
-      {/* Zoomed canvas modal — mobile only */}
-      {zoomed && isMobile && (
-        <div className="fixed inset-0 z-50 flex flex-col" style={{ background: 'rgba(10,10,10,0.95)' }}
-          onClick={() => setZoomed(false)}>
-          <div className="flex justify-between items-center px-4 py-3 flex-shrink-0">
-            <div className="font-display text-[10px] uppercase tracking-widest text-white opacity-70">
-              {format.label} · {format.w}×{format.h}
-            </div>
-            <button onClick={(e) => { e.stopPropagation(); setZoomed(false); }}
-              className="text-white opacity-80 p-2">
-              <X size={20} />
-            </button>
-          </div>
-          <div className="flex-1 flex items-center justify-center p-2" onClick={(e) => e.stopPropagation()}>
-            <div className="relative bg-black"
-              style={{
-                maxHeight: '100%', maxWidth: '100%',
-                aspectRatio: `${format.w} / ${format.h}`,
-                height: '100%',
-              }}>
-              {canvasElement}
-            </div>
-          </div>
-          <div className="text-center px-4 py-2 flex-shrink-0">
-            <div className="font-display text-[10px] uppercase tracking-widest text-white opacity-50">
-              Tap outside the post to close · drag notes to reposition
-            </div>
           </div>
         </div>
       )}
@@ -1714,12 +1769,53 @@ function SegmentEditor({ segment, sport, updateSegment, removeSegment, moveSegme
   );
 }
 
+/* NumberField — uses local state so the field can be temporarily empty while
+   editing. The parent value updates on each valid keystroke, but the displayed
+   text reflects exactly what the user typed (no surprise zero-prefixing on mobile).
+   On blur, if the field is empty or invalid, it falls back to 0. */
 function NumberField({ label, value, onChange, step = 1, integer = false }) {
+  const [local, setLocal] = useState(String(value));
+  const lastExternal = useRef(value);
+
+  useEffect(() => {
+    // External value changed (preset load, segment reorder) — adopt it
+    if (value !== lastExternal.current) {
+      lastExternal.current = value;
+      setLocal(String(value));
+    }
+  }, [value]);
+
   return (
     <div>
       <div className="text-[9px] uppercase tracking-wider mb-0.5" style={{ color: BRAND.muted }}>{label}</div>
-      <input type="number" step={step} value={value}
-        onChange={e => onChange(integer ? parseInt(e.target.value) || 0 : parseFloat(e.target.value) || 0)}
+      <input
+        type="text"
+        inputMode={integer ? 'numeric' : 'decimal'}
+        pattern={integer ? '[0-9]*' : '[0-9]*\\.?[0-9]*'}
+        value={local}
+        onChange={(e) => {
+          const raw = e.target.value;
+          // Allow only digits (and a single decimal point for non-integer fields)
+          const cleaned = integer
+            ? raw.replace(/[^0-9]/g, '')
+            : raw.replace(/[^0-9.]/g, '').replace(/(\..*)\./g, '$1');
+          setLocal(cleaned);
+          // Push valid numeric values to parent in real time; ignore empty/partial
+          if (cleaned === '' || cleaned === '.') return;
+          const num = integer ? parseInt(cleaned, 10) : parseFloat(cleaned);
+          if (!Number.isNaN(num)) {
+            lastExternal.current = num;
+            onChange(num);
+          }
+        }}
+        onBlur={() => {
+          // Empty field on blur → commit 0 and reflect that in the display
+          if (local === '' || local === '.') {
+            lastExternal.current = 0;
+            setLocal('0');
+            onChange(0);
+          }
+        }}
         className="w-full px-1.5 py-1 text-xs border" style={{ borderColor: BRAND.line }} />
     </div>
   );
@@ -2328,7 +2424,7 @@ function ExportPanel({ project, updateProject, saveProject, exportImage, exportV
   );
 }
 
-function PresetsPanel({ project, loadPreset, savedProjects, loadProject, deleteProject }) {
+function PresetsPanel({ project, loadPreset, savedProjects, loadProject, deleteProject, exportProjects, importProjects }) {
   const presets = PRESETS[project.sport] || [];
   return (
     <div className="space-y-5">
@@ -2350,7 +2446,7 @@ function PresetsPanel({ project, loadPreset, savedProjects, loadProject, deleteP
         <div className="font-display text-xs font-bold uppercase tracking-widest mb-2" style={{ color: BRAND.muted }}>Saved Projects</div>
         {savedProjects.length === 0 ? (
           <div className="text-[11px] py-2" style={{ color: BRAND.muted }}>
-            None saved yet — use Save in the top bar to persist your work.
+            None saved on this device yet — use Save (top bar on desktop, Export tab on mobile) to persist your work.
           </div>
         ) : (
           <div className="space-y-1.5">
@@ -2368,6 +2464,27 @@ function PresetsPanel({ project, loadPreset, savedProjects, loadProject, deleteP
             ))}
           </div>
         )}
+      </div>
+
+      <div>
+        <div className="font-display text-xs font-bold uppercase tracking-widest mb-2" style={{ color: BRAND.muted }}>Move Projects Between Devices</div>
+        <div className="text-[10px] mb-2 leading-relaxed" style={{ color: BRAND.muted }}>
+          Saved projects live in this browser only. To move them to another device, export them to a JSON file then import on the other device.
+        </div>
+        <div className="space-y-1.5">
+          {savedProjects.length > 0 && (
+            <button onClick={exportProjects}
+              className="font-display w-full flex items-center justify-center gap-1.5 py-2 text-xs font-semibold uppercase tracking-wider"
+              style={{ background: BRAND.white, border: `1px solid ${BRAND.line}` }}>
+              <Download size={12} /> Export all projects
+            </button>
+          )}
+          <label className="font-display w-full flex items-center justify-center gap-1.5 py-2 text-xs font-semibold uppercase tracking-wider cursor-pointer"
+            style={{ background: BRAND.white, border: `1px solid ${BRAND.line}` }}>
+            <Plus size={12} /> Import projects
+            <input type="file" accept="application/json,.json" onChange={importProjects} className="hidden" />
+          </label>
+        </div>
       </div>
     </div>
   );
