@@ -1223,7 +1223,7 @@ export default function App() {
       </div>
 
       {/* Workspace */}
-      <div className="grid" style={{ gridTemplateColumns: '340px 1fr 320px', height: 'calc(100vh - 56px)' }}>
+      <div className="grid" style={{ gridTemplateColumns: '400px 1fr 320px', height: 'calc(100vh - 56px)' }}>
         {/* LEFT */}
         <div className="flex flex-col border-r" style={{ borderColor: BRAND.line, background: BRAND.panel }}>
           <div className="flex border-b flex-wrap" style={{ borderColor: BRAND.line }}>
