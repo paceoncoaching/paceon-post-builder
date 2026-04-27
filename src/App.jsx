@@ -1048,10 +1048,10 @@ export default function App() {
       {/* Top bar */}
       <div className="border-b flex items-center justify-between px-5 py-3 flex-wrap gap-2" style={{ borderColor: BRAND.line, background: BRAND.white }}>
         <div className="flex items-center gap-6 flex-wrap">
-          <div className="font-display flex items-baseline gap-1">
-            <span className="text-xl font-extrabold tracking-tight">PACE</span>
-            <span className="text-xl font-extrabold tracking-tight" style={{ color: BRAND.orange }}>ON</span>
-            <span className="ml-2 text-xs uppercase tracking-widest" style={{ color: BRAND.muted }}>Post Builder</span>
+          <div className="flex items-center gap-3">
+             <img src="/logos/paceon-black.svg" alt="PaceOn Coaching" className="h-8 w-auto" />
+             <span className="font-display text-xs uppercase tracking-widest border-l pl-3"
+               style={{ color: BRAND.muted, borderColor: BRAND.line }}>Post Builder</span>
           </div>
 
           <Toggle label="Sport" options={['cycling', 'running']} value={project.sport} onChange={v => updateProject({ sport: v })} accent={BRAND.olive} />
