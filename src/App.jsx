@@ -1,8 +1,8 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import {
   Plus, Trash2, ArrowUp, ArrowDown, Repeat, Image as ImageIcon, Video,
-  Download, Save, FolderOpen, Sparkles, FileText, MessageSquare, Layers,
-  Bookmark, X, Copy, Eye, EyeOff,
+  Download, Save, FolderOpen, Sparkles, MessageSquare, Layers,
+  Bookmark, X, Copy, Eye, EyeOff, Move, Palette,
 } from 'lucide-react';
 
 /* =========================================================================
@@ -43,11 +43,24 @@ const ZONES_RUNNING = [
   { id: 5, name: 'Z5 VO2/Speed', low: 106, high: 999, color: '#a13d00' },
 ];
 
-const ANNOTATION_STYLES = {
-  coach:    { label: "Coach's Tip",    accent: BRAND.orange, icon: '◆' },
-  science:  { label: 'Science Note',   accent: BRAND.olive,  icon: '◇' },
-  mistake:  { label: 'Common Mistake', accent: '#7a2d00',    icon: '!' },
-  cue:      { label: 'Execution Cue',  accent: BRAND.black,  icon: '→' },
+// Style presets — sensible defaults for each annotation type, fully overridable
+const ANNOTATION_PRESETS = {
+  coach:    { label: "Coach's Tip",    bg: '#ffffff', text: '#1a1a1a', accent: '#c85103', accentBar: true },
+  science:  { label: 'Science Note',   bg: '#ffffff', text: '#1a1a1a', accent: '#6a714b', accentBar: true },
+  mistake:  { label: 'Common Mistake', bg: '#fff4ef', text: '#1a1a1a', accent: '#7a2d00', accentBar: true },
+  cue:      { label: 'Execution Cue',  bg: '#1a1a1a', text: '#ffffff', accent: '#c85103', accentBar: false },
+};
+
+const ARROW_STYLES = {
+  solid:  { label: 'Solid',  dash: [] },
+  dashed: { label: 'Dashed', dash: [12, 8] },
+  dotted: { label: 'Dotted', dash: [2, 6] },
+};
+
+const ARROW_HEADS = {
+  filled: { label: 'Filled' },
+  open:   { label: 'Open' },
+  none:   { label: 'None' },
 };
 
 const FORMATS = {
@@ -67,6 +80,15 @@ const GRAPH_STYLES = {
   block:    { label: 'Block' },
   gradient: { label: 'Gradient' },
   outlined: { label: 'Outlined' },
+};
+
+// Default position offsets (all in -1..1 range, 0 = layout default)
+const DEFAULT_POSITIONS = {
+  titleY: 0,           // shift title block up/down
+  graphY: 0,           // shift graph up/down (independent of title)
+  graphHeight: 0,      // grow/shrink graph
+  descriptionY: 0,     // shift description block up/down
+  metricsY: 0,         // shift metrics row up/down
 };
 
 function rid() { return Math.random().toString(36).slice(2, 10); }
@@ -235,6 +257,34 @@ function autoDraftCaption(title, segments, sport, description) {
   return `${title || "This week's key session"}\n\n${description}\n\n— Duration: ${fmtDuration(totalMin)}\n— IF: ${ifLow.toFixed(2)}–${ifHigh.toFixed(2)}\n— TSS: ${Math.round(tssLow)}–${Math.round(tssHigh)}\n\nPaceOn — evidence-driven coaching for athletes balancing ambition with life.\n\n#paceon ${tags}`;
 }
 
+// Migrate older annotations to include style fields with defaults
+function migrateAnnotation(a) {
+  const preset = ANNOTATION_PRESETS[a.style] || ANNOTATION_PRESETS.coach;
+  return {
+    bgColor: preset.bg,
+    textColor: preset.text,
+    accentColor: preset.accent,
+    accentBar: preset.accentBar,
+    arrowColor: preset.accent,
+    arrowStyle: 'solid',
+    arrowHead: 'filled',
+    arrowWidth: 2,
+    bubbleOpacity: 0.96,
+    showLabel: true,
+    customLabel: '',
+    bubbleWidth: 0.4, // fraction of canvas width
+    ...a,
+  };
+}
+
+function migrateProject(p) {
+  return {
+    ...p,
+    positions: { ...DEFAULT_POSITIONS, ...(p.positions || {}) },
+    annotations: (p.annotations || []).map(migrateAnnotation),
+  };
+}
+
 // ---------- Canvas drawing ----------
 function drawCanvas(ctx, opts) {
   const { project, format, sport, mediaEl, mediaType, hoverAnno } = opts;
@@ -285,10 +335,12 @@ function drawCanvas(ctx, opts) {
   }
 
   const pad = Math.round(W * 0.06);
+  const pos = project.positions || DEFAULT_POSITIONS;
   drawLogo(ctx, project, W, H, pad);
 
   const titleSize = Math.round(W * 0.072);
-  const titleY = pad + Math.round(W * 0.13);
+  const baseTitleY = pad + Math.round(W * 0.13);
+  const titleY = baseTitleY + Math.round(pos.titleY * H);
 
   const kickSize = Math.round(W * 0.022);
   ctx.font = `600 ${kickSize}px "League Spartan", system-ui, sans-serif`;
@@ -307,23 +359,28 @@ function drawCanvas(ctx, opts) {
   });
 
   const flat = flattenSegments(project.segments);
-  let graphHeight;
-  if (project.layout === 'graphLed') graphHeight = Math.round(H * 0.32);
-  else if (project.layout === 'descriptionLed') graphHeight = Math.round(H * 0.22);
-  else graphHeight = Math.round(H * 0.20);
-  const graphTop = cy + Math.round(W * 0.06);
+  let baseGraphHeight;
+  if (project.layout === 'graphLed') baseGraphHeight = Math.round(H * 0.32);
+  else if (project.layout === 'descriptionLed') baseGraphHeight = Math.round(H * 0.22);
+  else baseGraphHeight = Math.round(H * 0.20);
+  const graphHeight = Math.max(120, Math.round(baseGraphHeight + pos.graphHeight * H));
+  const baseGraphTop = cy + Math.round(W * 0.06);
+  const graphTop = baseGraphTop + Math.round(pos.graphY * H);
   const graphRect = { x: pad, y: graphTop, w: W - pad * 2, h: graphHeight };
   drawGraph(ctx, graphRect, flat, sport, project.graphStyle);
   drawAnnotations(ctx, project.annotations, flat, graphRect, W, hoverAnno);
 
-  const descTop = graphTop + graphHeight + Math.round(W * 0.06);
+  const baseDescTop = graphTop + graphHeight + Math.round(W * 0.06);
+  const descTop = baseDescTop + Math.round(pos.descriptionY * H);
   drawDescription(ctx, project.description, pad, descTop, W - pad * 2, W);
-  drawCalculations(ctx, flat, sport, pad, H, W);
+
+  const metricsOffset = Math.round(pos.metricsY * H);
+  drawCalculations(ctx, flat, sport, pad, H, W, metricsOffset);
 
   ctx.font = `600 ${Math.round(W * 0.018)}px "League Spartan", system-ui, sans-serif`;
   ctx.fillStyle = 'rgba(255,255,255,0.55)';
   ctx.textAlign = 'right';
-  ctx.fillText('paceon.com.au', W - pad, H - pad - Math.round(W * 0.07));
+  ctx.fillText('paceon.com.au', W - pad, H - pad - Math.round(W * 0.07) + metricsOffset);
 }
 
 function wrapText(ctx, text, maxWidth, maxLines) {
@@ -375,7 +432,7 @@ function drawLogo(ctx, project, W, H, pad) {
     const logoW = logoH * aspect;
     try { ctx.drawImage(logo.image, x, y, logoW, logoH); } catch (e) {}
   } else {
-    // Fallback wordmark
+    // Fallback wordmark if image hasn't loaded yet
     ctx.fillStyle = BRAND.white;
     ctx.font = `800 ${Math.round(W * 0.05)}px "League Spartan", system-ui, sans-serif`;
     ctx.textBaseline = 'top';
@@ -511,60 +568,85 @@ function drawAnnotations(ctx, annotations, flatSegs, graphRect, W, hoverAnno) {
     const noteX = graphRect.x + (a.notePos?.x ?? 0.7) * graphRect.w;
     const noteY = graphRect.y + (a.notePos?.y ?? -0.3) * graphRect.h;
 
-    const style = ANNOTATION_STYLES[a.style] || ANNOTATION_STYLES.coach;
-
-    ctx.strokeStyle = style.accent;
-    ctx.lineWidth = 2;
+    // Arrow
+    const arrowStyle = ARROW_STYLES[a.arrowStyle] || ARROW_STYLES.solid;
+    ctx.strokeStyle = a.arrowColor || a.accentColor || BRAND.orange;
+    ctx.lineWidth = a.arrowWidth || 2;
+    ctx.setLineDash(arrowStyle.dash);
     ctx.beginPath();
     ctx.moveTo(noteX, noteY);
     ctx.lineTo(targetX, targetY);
     ctx.stroke();
+    ctx.setLineDash([]);
 
+    // Arrow head
     const angle = Math.atan2(targetY - noteY, targetX - noteX);
-    const ah = 14;
-    ctx.fillStyle = style.accent;
-    ctx.beginPath();
-    ctx.moveTo(targetX, targetY);
-    ctx.lineTo(targetX - ah * Math.cos(angle - 0.4), targetY - ah * Math.sin(angle - 0.4));
-    ctx.lineTo(targetX - ah * Math.cos(angle + 0.4), targetY - ah * Math.sin(angle + 0.4));
-    ctx.closePath();
-    ctx.fill();
+    const ah = 14 + (a.arrowWidth || 2) * 1.5;
+    const headType = a.arrowHead || 'filled';
+    if (headType !== 'none') {
+      ctx.fillStyle = a.arrowColor || a.accentColor || BRAND.orange;
+      ctx.strokeStyle = a.arrowColor || a.accentColor || BRAND.orange;
+      ctx.lineWidth = a.arrowWidth || 2;
+      ctx.beginPath();
+      ctx.moveTo(targetX, targetY);
+      ctx.lineTo(targetX - ah * Math.cos(angle - 0.4), targetY - ah * Math.sin(angle - 0.4));
+      ctx.lineTo(targetX - ah * Math.cos(angle + 0.4), targetY - ah * Math.sin(angle + 0.4));
+      ctx.closePath();
+      if (headType === 'filled') ctx.fill();
+      else ctx.stroke();
+    }
 
-    const bubbleW = Math.min(W * 0.4, 380);
+    // Bubble dimensions
+    const bubbleW = Math.min(W * (a.bubbleWidth || 0.4), W - 40);
     const padB = 14;
     const labelSize = Math.round(W * 0.018);
     const bodySize = Math.round(W * 0.022);
 
     ctx.font = `400 ${bodySize}px Roboto, system-ui, sans-serif`;
     const lines = wrapTextAll(ctx, a.text || '', bubbleW - padB * 2);
-    const bubbleH = padB * 2 + labelSize + 8 + lines.length * (bodySize * 1.3);
+    const labelLine = a.showLabel !== false;
+    const labelText = a.customLabel || (ANNOTATION_PRESETS[a.style] || ANNOTATION_PRESETS.coach).label;
+    const bubbleH = padB * 2 + (labelLine ? labelSize + 8 : 0) + lines.length * (bodySize * 1.3);
 
-    ctx.fillStyle = 'rgba(255,255,255,0.96)';
+    // Bubble background
+    const bgColor = a.bgColor || '#ffffff';
+    const opacity = a.bubbleOpacity ?? 0.96;
+    ctx.fillStyle = hexA(bgColor, opacity);
     roundRect(ctx, noteX - bubbleW / 2, noteY - bubbleH / 2, bubbleW, bubbleH, 6);
     ctx.fill();
 
-    ctx.fillStyle = style.accent;
-    ctx.fillRect(noteX - bubbleW / 2, noteY - bubbleH / 2, 4, bubbleH);
+    // Accent bar
+    if (a.accentBar !== false) {
+      ctx.fillStyle = a.accentColor || BRAND.orange;
+      ctx.fillRect(noteX - bubbleW / 2, noteY - bubbleH / 2, 4, bubbleH);
+    }
 
-    ctx.fillStyle = style.accent;
-    ctx.font = `700 ${labelSize}px "League Spartan", system-ui, sans-serif`;
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'top';
-    ctx.fillText(style.label.toUpperCase(), noteX - bubbleW / 2 + padB + 4, noteY - bubbleH / 2 + padB);
+    // Label
+    if (labelLine) {
+      ctx.fillStyle = a.accentColor || BRAND.orange;
+      ctx.font = `700 ${labelSize}px "League Spartan", system-ui, sans-serif`;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'top';
+      ctx.fillText(labelText.toUpperCase(), noteX - bubbleW / 2 + padB + 4, noteY - bubbleH / 2 + padB);
+    }
 
-    ctx.fillStyle = BRAND.ink;
+    // Body
+    ctx.fillStyle = a.textColor || BRAND.ink;
     ctx.font = `400 ${bodySize}px Roboto, system-ui, sans-serif`;
-    let ly = noteY - bubbleH / 2 + padB + labelSize + 8;
+    let ly = noteY - bubbleH / 2 + padB + (labelLine ? labelSize + 8 : 0);
     lines.forEach(line => {
       ctx.fillText(line, noteX - bubbleW / 2 + padB + 4, ly);
       ly += bodySize * 1.3;
     });
 
+    // Hover indicator
     if (hoverAnno === a.id) {
-      ctx.strokeStyle = style.accent;
+      ctx.strokeStyle = a.accentColor || BRAND.orange;
       ctx.lineWidth = 2;
-      roundRect(ctx, noteX - bubbleW / 2, noteY - bubbleH / 2, bubbleW, bubbleH, 6);
+      ctx.setLineDash([8, 4]);
+      roundRect(ctx, noteX - bubbleW / 2 - 4, noteY - bubbleH / 2 - 4, bubbleW + 8, bubbleH + 8, 8);
       ctx.stroke();
+      ctx.setLineDash([]);
     }
   });
 }
@@ -578,17 +660,17 @@ function drawDescription(ctx, text, x, y, w, W) {
   ctx.textAlign = 'left';
   const lines = wrapTextAll(ctx, text, w);
   let cy = y;
-  lines.slice(0, 6).forEach(line => {
+  lines.slice(0, 8).forEach(line => {
     ctx.fillText(line, x, cy);
     cy += size * 1.4;
   });
 }
 
-function drawCalculations(ctx, flatSegs, sport, pad, H, W) {
+function drawCalculations(ctx, flatSegs, sport, pad, H, W, yOffset = 0) {
   if (!flatSegs.length) return;
   const m = calculateMetrics(flatSegs, sport);
   const pillH = Math.round(W * 0.07);
-  const y = H - pad - pillH;
+  const y = H - pad - pillH + yOffset;
   const pillSize = Math.round(W * 0.022);
   const labelSize = Math.round(W * 0.016);
 
@@ -652,6 +734,7 @@ function shade(hex, percent) {
 }
 
 function hexA(hex, alpha) {
+  if (!hex || !hex.startsWith('#')) return `rgba(0,0,0,${alpha})`;
   const n = parseInt(hex.slice(1), 16);
   return `rgba(${n >> 16},${(n >> 8) & 0xff},${n & 0xff},${alpha})`;
 }
@@ -668,8 +751,10 @@ const DEFAULT_PROJECT = {
   caption: '',
   annotations: [],
   background: { tint: 0.55, gradient: true, gradientTop: 0.4, gradientBottom: 0.7 },
-  logo: { variant: 'white', image: null, customImage: null },
+  // logo state stripped of `image` — image lives in a ref, never in saved JSON
+  logo: { variant: 'white', hasCustom: false },
   videoLoopLength: 10,
+  positions: { ...DEFAULT_POSITIONS },
 };
 
 export default function App() {
@@ -680,7 +765,11 @@ export default function App() {
   const [hoverAnno, setHoverAnno] = useState(null);
   const [draggingAnno, setDraggingAnno] = useState(null);
   const [bgFile, setBgFile] = useState(null);
-  const [bundledLogos, setBundledLogos] = useState({ white: null, black: null });
+
+  // Logo images — kept in refs, separate from project state to survive save/load
+  const bundledLogos = useRef({ white: null, black: null });
+  const customLogo = useRef(null);
+  const [logosReady, setLogosReady] = useState(false);
 
   const canvasRef = useRef(null);
   const mediaRef = useRef(null);
@@ -691,7 +780,13 @@ export default function App() {
   const flat = useMemo(() => flattenSegments(project.segments), [project.segments]);
   const metrics = useMemo(() => calculateMetrics(flat, project.sport), [flat, project.sport]);
 
-  // Load bundled logos on mount
+  // Resolve which logo image to draw (computed each render, never stored)
+  const activeLogoImage = useMemo(() => {
+    if (project.logo.hasCustom && customLogo.current) return customLogo.current;
+    return project.logo.variant === 'white' ? bundledLogos.current.white : bundledLogos.current.black;
+  }, [project.logo.variant, project.logo.hasCustom, logosReady]);
+
+  // Load bundled logos once on mount
   useEffect(() => {
     const loadLogo = (path) => new Promise((resolve) => {
       const img = new Image();
@@ -701,22 +796,16 @@ export default function App() {
       img.src = path;
     });
     Promise.all([loadLogo('/logos/paceon-white.svg'), loadLogo('/logos/paceon-black.svg')])
-      .then(([white, black]) => setBundledLogos({ white, black }));
+      .then(([white, black]) => {
+        bundledLogos.current = { white, black };
+        setLogosReady(true);
+      });
 
-    // Load saved projects from localStorage
     try {
       const saved = JSON.parse(localStorage.getItem('paceon:projects') || '{}');
       setSavedProjects(Object.keys(saved));
     } catch (e) {}
   }, []);
-
-  // Switch logo image when variant changes (uses custom upload if present)
-  useEffect(() => {
-    setProject(p => {
-      const img = p.logo.customImage || (p.logo.variant === 'white' ? bundledLogos.white : bundledLogos.black);
-      return { ...p, logo: { ...p.logo, image: img } };
-    });
-  }, [project.logo.variant, project.logo.customImage, bundledLogos]);
 
   // Background media handling
   useEffect(() => {
@@ -741,7 +830,7 @@ export default function App() {
     }
   }, [bgFile]);
 
-  // Render loop
+  // Render loop — uses activeLogoImage as a transient prop
   useEffect(() => {
     let mounted = true;
     const render = () => {
@@ -749,8 +838,10 @@ export default function App() {
       const canvas = canvasRef.current;
       if (canvas) {
         const ctx = canvas.getContext('2d');
+        const projectWithLogoImage = { ...project, logo: { ...project.logo, image: activeLogoImage } };
         drawCanvas(ctx, {
-          project, format, sport: project.sport,
+          project: projectWithLogoImage,
+          format, sport: project.sport,
           mediaEl: mediaRef.current, mediaType: bgFile?.type || null, hoverAnno,
         });
       }
@@ -758,23 +849,29 @@ export default function App() {
     };
     render();
     return () => { mounted = false; if (animRef.current) cancelAnimationFrame(animRef.current); };
-  }, [project, format, bgFile, hoverAnno]);
+  }, [project, format, bgFile, hoverAnno, activeLogoImage]);
 
-  // Mouse interaction
   const getGraphRect = useCallback(() => {
     const c = canvasRef.current;
+    if (!c) return { x: 0, y: 0, w: 0, h: 0 };
     const W = format.w, H = format.h;
     const pad = Math.round(W * 0.06);
     const titleSize = Math.round(W * 0.072);
-    const titleY = pad + Math.round(W * 0.13);
+    const pos = project.positions || DEFAULT_POSITIONS;
+    const baseTitleY = pad + Math.round(W * 0.13);
+    const titleY = baseTitleY + Math.round(pos.titleY * H);
     const ctx = c.getContext('2d');
     ctx.font = `700 ${titleSize}px "League Spartan", system-ui, sans-serif`;
     const titleLines = wrapText(ctx, (project.title || 'Workout Title').toUpperCase(), W - pad * 2, 2);
     const titleEnd = titleY + titleLines.length * titleSize * 1.05;
-    const graphTop = titleEnd + Math.round(W * 0.06);
-    const graphHeight = project.layout === 'graphLed' ? Math.round(H * 0.32) : project.layout === 'descriptionLed' ? Math.round(H * 0.22) : Math.round(H * 0.20);
+    let baseGraphHeight;
+    if (project.layout === 'graphLed') baseGraphHeight = Math.round(H * 0.32);
+    else if (project.layout === 'descriptionLed') baseGraphHeight = Math.round(H * 0.22);
+    else baseGraphHeight = Math.round(H * 0.20);
+    const graphHeight = Math.max(120, Math.round(baseGraphHeight + pos.graphHeight * H));
+    const graphTop = titleEnd + Math.round(W * 0.06) + Math.round(pos.graphY * H);
     return { x: pad, y: graphTop, w: W - pad * 2, h: graphHeight };
-  }, [format, project.title, project.layout]);
+  }, [format, project.title, project.layout, project.positions]);
 
   const handleCanvasMouseDown = (e) => {
     const c = canvasRef.current;
@@ -803,8 +900,8 @@ export default function App() {
         targetY = graphRect.y + (a.arrowPos?.y || 0.5) * graphRect.h;
       }
 
-      const bubbleW = Math.min(format.w * 0.4, 380);
-      const bubbleH = 200;
+      const bubbleW = Math.min(format.w * (a.bubbleWidth || 0.4), format.w - 40);
+      const bubbleH = 220;
       if (Math.abs(x - noteX) < bubbleW / 2 && Math.abs(y - noteY) < bubbleH / 2) {
         setDraggingAnno({ id: a.id, mode: 'note' });
         return;
@@ -895,33 +992,63 @@ export default function App() {
     }));
   };
 
-  const addAnnotation = () => {
-    const a = {
+  const addAnnotation = (styleKey = 'science') => {
+    const preset = ANNOTATION_PRESETS[styleKey];
+    const a = migrateAnnotation({
       id: rid(),
-      style: 'science',
+      style: styleKey,
       text: 'Heart rate drift is the gradual rise in heart rate over time during steady-state exercise despite constant power or pace, typically caused by fatigue, dehydration, heat stress, or reduced cardiovascular efficiency.',
       targetMode: 'segment',
       targetIndex: 0,
       notePos: { x: 0.7, y: -0.4 },
       arrowPos: { x: 0.5, y: 0.5 },
       visible: true,
-    };
+      bgColor: preset.bg,
+      textColor: preset.text,
+      accentColor: preset.accent,
+      arrowColor: preset.accent,
+    });
     setProject(p => ({ ...p, annotations: [...p.annotations, a] }));
   };
 
   const updateAnnotation = (id, patch) => setProject(p => ({ ...p, annotations: p.annotations.map(a => a.id === id ? { ...a, ...patch } : a) }));
   const removeAnnotation = (id) => setProject(p => ({ ...p, annotations: p.annotations.filter(a => a.id !== id) }));
 
-  // Save / Load (localStorage)
+  const resetAnnotationStyle = (id) => {
+    setProject(p => ({
+      ...p,
+      annotations: p.annotations.map(a => {
+        if (a.id !== id) return a;
+        const preset = ANNOTATION_PRESETS[a.style] || ANNOTATION_PRESETS.coach;
+        return {
+          ...a,
+          bgColor: preset.bg,
+          textColor: preset.text,
+          accentColor: preset.accent,
+          accentBar: preset.accentBar,
+          arrowColor: preset.accent,
+          arrowStyle: 'solid',
+          arrowHead: 'filled',
+          arrowWidth: 2,
+          bubbleOpacity: 0.96,
+          bubbleWidth: 0.4,
+          showLabel: true,
+          customLabel: '',
+        };
+      }),
+    }));
+  };
+
+  // Save / Load — serialise everything except non-cloneable image objects
   const saveProject = () => {
     const name = prompt('Project name:');
     if (!name) return;
     try {
       const all = JSON.parse(localStorage.getItem('paceon:projects') || '{}');
+      // Strip any transient image fields. Logo state is already image-free.
       const serialisable = {
         ...project,
-        logo: { ...project.logo, image: null, customImage: null },
-        _customLogo: project.logo.customImage ? null : null,
+        logo: { variant: project.logo.variant, hasCustom: project.logo.hasCustom },
         _bgFile: bgFile,
       };
       all[name] = serialisable;
@@ -940,7 +1067,12 @@ export default function App() {
       const data = all[name];
       if (!data) return;
       const { _bgFile, ...proj } = data;
-      setProject({ ...proj, logo: { ...proj.logo, image: null, customImage: null } });
+      // Reset hasCustom if customLogo isn't in memory (it can't survive save/load)
+      const restoredLogo = {
+        variant: proj.logo?.variant || 'white',
+        hasCustom: proj.logo?.hasCustom && customLogo.current ? true : false,
+      };
+      setProject(migrateProject({ ...proj, logo: restoredLogo }));
       if (_bgFile) setBgFile(_bgFile);
     } catch (e) {}
   };
@@ -970,13 +1102,19 @@ export default function App() {
     reader.onload = () => {
       const img = new Image();
       img.crossOrigin = 'anonymous';
-      img.onload = () => setProject(p => ({ ...p, logo: { ...p.logo, customImage: img } }));
+      img.onload = () => {
+        customLogo.current = img;
+        setProject(p => ({ ...p, logo: { ...p.logo, hasCustom: true } }));
+      };
       img.src = reader.result;
     };
     reader.readAsDataURL(file);
   };
 
-  const resetLogo = () => setProject(p => ({ ...p, logo: { ...p.logo, customImage: null } }));
+  const resetLogo = () => {
+    customLogo.current = null;
+    setProject(p => ({ ...p, logo: { ...p.logo, hasCustom: false } }));
+  };
 
   // Export
   const exportImage = () => {
@@ -999,11 +1137,8 @@ export default function App() {
     setExportStatus(`Recording ${project.videoLoopLength}s loop...`);
 
     const mimeCandidates = [
-      'video/mp4;codecs=avc1',
-      'video/mp4',
-      'video/webm;codecs=vp9',
-      'video/webm;codecs=vp8',
-      'video/webm',
+      'video/mp4;codecs=avc1', 'video/mp4',
+      'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm',
     ];
     let mime = '';
     for (const m of mimeCandidates) {
@@ -1048,10 +1183,10 @@ export default function App() {
       {/* Top bar */}
       <div className="border-b flex items-center justify-between px-5 py-3 flex-wrap gap-2" style={{ borderColor: BRAND.line, background: BRAND.white }}>
         <div className="flex items-center gap-6 flex-wrap">
-          <div className="font-display flex items-baseline gap-1">
-            <span className="text-xl font-extrabold tracking-tight">PACE</span>
-            <span className="text-xl font-extrabold tracking-tight" style={{ color: BRAND.orange }}>ON</span>
-            <span className="ml-2 text-xs uppercase tracking-widest" style={{ color: BRAND.muted }}>Post Builder</span>
+          <div className="flex items-center gap-3">
+            <img src="/logos/paceon-black.svg" alt="PaceOn Coaching" className="h-8 w-auto" />
+            <span className="font-display text-xs uppercase tracking-widest border-l pl-3"
+              style={{ color: BRAND.muted, borderColor: BRAND.line }}>Post Builder</span>
           </div>
 
           <Toggle label="Sport" options={['cycling', 'running']} value={project.sport} onChange={v => updateProject({ sport: v })} accent={BRAND.olive} />
@@ -1091,13 +1226,14 @@ export default function App() {
       <div className="grid" style={{ gridTemplateColumns: '340px 1fr 320px', height: 'calc(100vh - 56px)' }}>
         {/* LEFT */}
         <div className="flex flex-col border-r" style={{ borderColor: BRAND.line, background: BRAND.panel }}>
-          <div className="flex border-b" style={{ borderColor: BRAND.line }}>
+          <div className="flex border-b flex-wrap" style={{ borderColor: BRAND.line }}>
             {[
-              { k: 'build', l: 'Build', i: <Layers size={13} /> },
-              { k: 'style', l: 'Style', i: <Sparkles size={13} /> },
-              { k: 'background', l: 'BG', i: <ImageIcon size={13} /> },
-              { k: 'annotate', l: 'Notes', i: <MessageSquare size={13} /> },
-              { k: 'presets', l: 'Presets', i: <Bookmark size={13} /> },
+              { k: 'build',      l: 'Build',   i: <Layers size={13} /> },
+              { k: 'style',      l: 'Style',   i: <Sparkles size={13} /> },
+              { k: 'background', l: 'BG',      i: <ImageIcon size={13} /> },
+              { k: 'annotate',   l: 'Notes',   i: <MessageSquare size={13} /> },
+              { k: 'layout',     l: 'Layout',  i: <Move size={13} /> },
+              { k: 'presets',    l: 'Presets', i: <Bookmark size={13} /> },
             ].map(t => (
               <button key={t.k} onClick={() => setActiveTab(t.k)}
                 className="font-display flex-1 flex items-center justify-center gap-1 py-2 text-[10px] font-semibold uppercase tracking-wider"
@@ -1105,6 +1241,7 @@ export default function App() {
                   borderBottom: `2px solid ${activeTab === t.k ? BRAND.orange : 'transparent'}`,
                   color: activeTab === t.k ? BRAND.ink : BRAND.muted,
                   background: activeTab === t.k ? BRAND.white : 'transparent',
+                  minWidth: 56,
                 }}>
                 {t.i} {t.l}
               </button>
@@ -1126,7 +1263,11 @@ export default function App() {
             )}
             {activeTab === 'annotate' && (
               <AnnotatePanel project={project} flat={flat} addAnnotation={addAnnotation}
-                updateAnnotation={updateAnnotation} removeAnnotation={removeAnnotation} />
+                updateAnnotation={updateAnnotation} removeAnnotation={removeAnnotation}
+                resetAnnotationStyle={resetAnnotationStyle} />
+            )}
+            {activeTab === 'layout' && (
+              <LayoutPanel project={project} updateProject={updateProject} />
             )}
             {activeTab === 'presets' && (
               <PresetsPanel project={project} loadPreset={loadPreset} savedProjects={savedProjects}
@@ -1416,7 +1557,7 @@ function StylePanel({ project, updateProject, handleLogoUpload, resetLogo }) {
             </button>
           ))}
         </div>
-        {project.logo.customImage ? (
+        {project.logo.hasCustom ? (
           <button onClick={resetLogo}
             className="font-display w-full flex items-center justify-center gap-1 py-2 text-xs font-semibold uppercase tracking-wider"
             style={{ background: BRAND.white, border: `1px solid ${BRAND.line}`, color: '#a13d00' }}>
@@ -1505,12 +1646,14 @@ function BackgroundPanel({ project, updateProject, bgFile, setBgFile, handleBack
   );
 }
 
-function SliderInput({ label, min, max, step, value, onChange }) {
+function SliderInput({ label, min, max, step, value, onChange, format }) {
   return (
     <div>
       <div className="flex justify-between text-[10px] mb-1">
         <span className="font-display font-semibold uppercase tracking-wider" style={{ color: BRAND.muted }}>{label}</span>
-        <span className="font-display font-bold" style={{ color: BRAND.ink }}>{Math.round(value * 100)}%</span>
+        <span className="font-display font-bold" style={{ color: BRAND.ink }}>
+          {format ? format(value) : `${Math.round(value * 100)}%`}
+        </span>
       </div>
       <input type="range" min={min} max={max} step={step} value={value}
         onChange={e => onChange(parseFloat(e.target.value))}
@@ -1519,55 +1662,194 @@ function SliderInput({ label, min, max, step, value, onChange }) {
   );
 }
 
-function AnnotatePanel({ project, flat, addAnnotation, updateAnnotation, removeAnnotation }) {
+function ColorRow({ label, value, onChange }) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="font-display text-[10px] uppercase tracking-wider flex-1" style={{ color: BRAND.muted }}>{label}</span>
+      <input type="color" value={value} onChange={e => onChange(e.target.value)}
+        className="w-7 h-7 cursor-pointer" style={{ border: `1px solid ${BRAND.line}` }} />
+      <input type="text" value={value} onChange={e => onChange(e.target.value)}
+        className="w-20 px-1.5 py-0.5 text-[11px] font-mono border" style={{ borderColor: BRAND.line }} />
+    </div>
+  );
+}
+
+function AnnotatePanel({ project, flat, addAnnotation, updateAnnotation, removeAnnotation, resetAnnotationStyle }) {
+  const [expandedAnno, setExpandedAnno] = useState(null);
+  const [showStylePicker, setShowStylePicker] = useState(false);
+
   return (
     <div>
       <div className="flex items-center justify-between mb-3">
         <div className="font-display text-xs font-bold uppercase tracking-widest" style={{ color: BRAND.muted }}>Annotations</div>
-        <button onClick={addAnnotation} className="font-display flex items-center gap-1 text-[10px] uppercase tracking-wider font-semibold"
+        <button onClick={() => setShowStylePicker(s => !s)}
+          className="font-display flex items-center gap-1 text-[10px] uppercase tracking-wider font-semibold"
           style={{ color: BRAND.orange }}>
           <Plus size={11} /> Add
         </button>
       </div>
 
+      {showStylePicker && (
+        <div className="mb-3 grid grid-cols-2 gap-1.5 p-2" style={{ background: BRAND.white, border: `1px solid ${BRAND.line}` }}>
+          {Object.entries(ANNOTATION_PRESETS).map(([k, p]) => (
+            <button key={k} onClick={() => { addAnnotation(k); setShowStylePicker(false); }}
+              className="text-left p-2 hover:bg-gray-50 transition" style={{ border: `1px solid ${BRAND.line}` }}>
+              <div className="flex items-center gap-1.5 mb-1">
+                <div style={{ width: 8, height: 8, background: p.accent }} />
+                <span className="font-display text-[10px] font-bold uppercase tracking-wider">{p.label}</span>
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
+
       <div className="space-y-2">
         {project.annotations.map(a => (
-          <div key={a.id} className="bg-white border p-2.5" style={{ borderColor: BRAND.line }}>
-            <div className="flex items-center justify-between mb-2">
-              <div className="flex items-center gap-1.5">
-                <div style={{ width: 10, height: 10, background: ANNOTATION_STYLES[a.style].accent }} />
-                <select value={a.style} onChange={e => updateAnnotation(a.id, { style: e.target.value })}
-                  className="font-display text-[10px] font-semibold uppercase tracking-wider bg-transparent">
-                  {Object.entries(ANNOTATION_STYLES).map(([k, s]) => (
-                    <option key={k} value={k}>{s.label}</option>
-                  ))}
-                </select>
+          <div key={a.id} className="bg-white border" style={{ borderColor: BRAND.line }}>
+            <div className="p-2.5">
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center gap-1.5">
+                  <div style={{ width: 10, height: 10, background: a.accentColor || ANNOTATION_PRESETS[a.style].accent }} />
+                  <select value={a.style} onChange={e => {
+                    const newStyle = e.target.value;
+                    const preset = ANNOTATION_PRESETS[newStyle];
+                    updateAnnotation(a.id, {
+                      style: newStyle,
+                      bgColor: preset.bg, textColor: preset.text,
+                      accentColor: preset.accent, accentBar: preset.accentBar,
+                      arrowColor: preset.accent,
+                    });
+                  }}
+                    className="font-display text-[10px] font-semibold uppercase tracking-wider bg-transparent">
+                    {Object.entries(ANNOTATION_PRESETS).map(([k, s]) => (
+                      <option key={k} value={k}>{s.label}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="flex items-center gap-0.5">
+                  <button onClick={() => setExpandedAnno(expandedAnno === a.id ? null : a.id)}
+                    className="p-1" style={{ color: expandedAnno === a.id ? BRAND.orange : BRAND.muted }}
+                    title="Customise style">
+                    <Palette size={11} />
+                  </button>
+                  <button onClick={() => updateAnnotation(a.id, { visible: !a.visible })}
+                    className="p-1" style={{ color: a.visible ? BRAND.ink : BRAND.muted }}>
+                    {a.visible ? <Eye size={11} /> : <EyeOff size={11} />}
+                  </button>
+                  <button onClick={() => removeAnnotation(a.id)} className="p-1" style={{ color: '#a13d00' }}>
+                    <Trash2 size={11} />
+                  </button>
+                </div>
               </div>
-              <div className="flex items-center gap-0.5">
-                <button onClick={() => updateAnnotation(a.id, { visible: !a.visible })}
-                  className="p-1" style={{ color: a.visible ? BRAND.ink : BRAND.muted }}>
-                  {a.visible ? <Eye size={11} /> : <EyeOff size={11} />}
-                </button>
-                <button onClick={() => removeAnnotation(a.id)} className="p-1" style={{ color: '#a13d00' }}>
-                  <Trash2 size={11} />
-                </button>
-              </div>
+
+              <div className="text-[10px] mb-1 font-display uppercase tracking-wider" style={{ color: BRAND.muted }}>Target Segment</div>
+              <select value={a.targetMode === 'segment' ? a.targetIndex : 'free'}
+                onChange={e => {
+                  if (e.target.value === 'free') updateAnnotation(a.id, { targetMode: 'free' });
+                  else updateAnnotation(a.id, { targetMode: 'segment', targetIndex: parseInt(e.target.value) });
+                }}
+                className="w-full text-xs px-1.5 py-1 border mb-2" style={{ borderColor: BRAND.line }}>
+                {flat.map((s, i) => (
+                  <option key={i} value={i}>{i + 1}. {s.label} ({fmtDuration(s.duration)})</option>
+                ))}
+                <option value="free">— Free position (drag tip) —</option>
+              </select>
+
+              <textarea value={a.text} onChange={e => updateAnnotation(a.id, { text: e.target.value })}
+                rows={4}
+                className="w-full text-xs px-1.5 py-1 border" style={{ borderColor: BRAND.line, resize: 'vertical' }} />
             </div>
-            <div className="text-[10px] mb-1 font-display uppercase tracking-wider" style={{ color: BRAND.muted }}>Target Segment</div>
-            <select value={a.targetMode === 'segment' ? a.targetIndex : 'free'}
-              onChange={e => {
-                if (e.target.value === 'free') updateAnnotation(a.id, { targetMode: 'free' });
-                else updateAnnotation(a.id, { targetMode: 'segment', targetIndex: parseInt(e.target.value) });
-              }}
-              className="w-full text-xs px-1.5 py-1 border mb-2" style={{ borderColor: BRAND.line }}>
-              {flat.map((s, i) => (
-                <option key={i} value={i}>{i + 1}. {s.label} ({fmtDuration(s.duration)})</option>
-              ))}
-              <option value="free">— Free position (drag tip) —</option>
-            </select>
-            <textarea value={a.text} onChange={e => updateAnnotation(a.id, { text: e.target.value })}
-              rows={4}
-              className="w-full text-xs px-1.5 py-1 border" style={{ borderColor: BRAND.line, resize: 'vertical' }} />
+
+            {expandedAnno === a.id && (
+              <div className="p-2.5 border-t space-y-3" style={{ borderColor: BRAND.line, background: BRAND.panel }}>
+                <div className="font-display text-[10px] font-bold uppercase tracking-widest" style={{ color: BRAND.muted }}>
+                  Bubble
+                </div>
+                <ColorRow label="Background" value={a.bgColor} onChange={v => updateAnnotation(a.id, { bgColor: v })} />
+                <ColorRow label="Text colour" value={a.textColor} onChange={v => updateAnnotation(a.id, { textColor: v })} />
+                <ColorRow label="Accent" value={a.accentColor} onChange={v => updateAnnotation(a.id, { accentColor: v })} />
+                <SliderInput label="Bubble width" min={0.2} max={0.85} step={0.05}
+                  value={a.bubbleWidth || 0.4}
+                  format={v => `${Math.round(v * 100)}%`}
+                  onChange={v => updateAnnotation(a.id, { bubbleWidth: v })} />
+                <SliderInput label="Background opacity" min={0} max={1} step={0.05}
+                  value={a.bubbleOpacity ?? 0.96}
+                  onChange={v => updateAnnotation(a.id, { bubbleOpacity: v })} />
+
+                <div className="flex items-center gap-2">
+                  <input type="checkbox" id={`bar-${a.id}`} checked={a.accentBar !== false}
+                    onChange={e => updateAnnotation(a.id, { accentBar: e.target.checked })} />
+                  <label htmlFor={`bar-${a.id}`} className="font-display text-[10px] uppercase tracking-wider" style={{ color: BRAND.muted }}>
+                    Show accent bar
+                  </label>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input type="checkbox" id={`label-${a.id}`} checked={a.showLabel !== false}
+                    onChange={e => updateAnnotation(a.id, { showLabel: e.target.checked })} />
+                  <label htmlFor={`label-${a.id}`} className="font-display text-[10px] uppercase tracking-wider" style={{ color: BRAND.muted }}>
+                    Show label
+                  </label>
+                </div>
+                {a.showLabel !== false && (
+                  <div>
+                    <div className="font-display text-[10px] uppercase tracking-wider mb-1" style={{ color: BRAND.muted }}>
+                      Custom label (blank = use preset)
+                    </div>
+                    <input value={a.customLabel || ''}
+                      placeholder={ANNOTATION_PRESETS[a.style].label}
+                      onChange={e => updateAnnotation(a.id, { customLabel: e.target.value })}
+                      className="w-full text-xs px-1.5 py-1 border" style={{ borderColor: BRAND.line }} />
+                  </div>
+                )}
+
+                <div className="font-display text-[10px] font-bold uppercase tracking-widest pt-2" style={{ color: BRAND.muted }}>
+                  Arrow
+                </div>
+                <ColorRow label="Colour" value={a.arrowColor} onChange={v => updateAnnotation(a.id, { arrowColor: v })} />
+                <div>
+                  <div className="font-display text-[10px] uppercase tracking-wider mb-1" style={{ color: BRAND.muted }}>Line style</div>
+                  <div className="grid grid-cols-3 gap-1">
+                    {Object.entries(ARROW_STYLES).map(([k, s]) => (
+                      <button key={k} onClick={() => updateAnnotation(a.id, { arrowStyle: k })}
+                        className="font-display py-1 text-[10px] font-semibold uppercase tracking-wider"
+                        style={{
+                          background: a.arrowStyle === k ? BRAND.ink : BRAND.white,
+                          color: a.arrowStyle === k ? BRAND.white : BRAND.ink,
+                          border: `1px solid ${BRAND.line}`,
+                        }}>
+                        {s.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <div className="font-display text-[10px] uppercase tracking-wider mb-1" style={{ color: BRAND.muted }}>Head</div>
+                  <div className="grid grid-cols-3 gap-1">
+                    {Object.entries(ARROW_HEADS).map(([k, s]) => (
+                      <button key={k} onClick={() => updateAnnotation(a.id, { arrowHead: k })}
+                        className="font-display py-1 text-[10px] font-semibold uppercase tracking-wider"
+                        style={{
+                          background: a.arrowHead === k ? BRAND.ink : BRAND.white,
+                          color: a.arrowHead === k ? BRAND.white : BRAND.ink,
+                          border: `1px solid ${BRAND.line}`,
+                        }}>
+                        {s.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <SliderInput label="Line thickness" min={1} max={6} step={0.5}
+                  value={a.arrowWidth || 2}
+                  format={v => `${v}px`}
+                  onChange={v => updateAnnotation(a.id, { arrowWidth: v })} />
+
+                <button onClick={() => resetAnnotationStyle(a.id)}
+                  className="font-display w-full py-1.5 text-[10px] font-semibold uppercase tracking-wider"
+                  style={{ background: BRAND.white, border: `1px solid ${BRAND.line}`, color: BRAND.muted }}>
+                  Reset to preset defaults
+                </button>
+              </div>
+            )}
           </div>
         ))}
 
@@ -1578,6 +1860,64 @@ function AnnotatePanel({ project, flat, addAnnotation, updateAnnotation, removeA
             Add explanatory notes that point to specific segments — perfect for explaining heart-rate drift, cadence cues, or pacing strategy.
           </div>
         )}
+      </div>
+
+      {project.annotations.length > 0 && (
+        <div className="mt-4 p-2 text-[10px] leading-relaxed" style={{ background: BRAND.white, border: `1px solid ${BRAND.line}`, color: BRAND.muted }}>
+          <strong className="font-display uppercase tracking-wider" style={{ color: BRAND.ink }}>Tip:</strong> drag any bubble on the canvas to reposition it. If notes are covering the graph, also try the <strong>Layout</strong> tab to move the graph up or shrink it.
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LayoutPanel({ project, updateProject }) {
+  const positions = project.positions || DEFAULT_POSITIONS;
+  const setPos = (patch) => updateProject({ positions: { ...positions, ...patch } });
+  const reset = () => updateProject({ positions: { ...DEFAULT_POSITIONS } });
+
+  // Slider range: -0.3 means up to 30% of canvas height up, +0.3 means down
+  return (
+    <div className="space-y-5">
+      <div className="text-[11px] leading-relaxed" style={{ color: BRAND.muted }}>
+        Fine-tune where each element sits on the canvas. All offsets are relative to the layout default — set them all back to zero with the reset button below.
+      </div>
+
+      <div className="space-y-4">
+        <SliderInput label="Title position" min={-0.15} max={0.3} step={0.01}
+          value={positions.titleY}
+          format={v => v === 0 ? 'default' : `${v > 0 ? '+' : ''}${Math.round(v * 100)}%`}
+          onChange={v => setPos({ titleY: v })} />
+
+        <SliderInput label="Graph position" min={-0.2} max={0.4} step={0.01}
+          value={positions.graphY}
+          format={v => v === 0 ? 'default' : `${v > 0 ? '+' : ''}${Math.round(v * 100)}%`}
+          onChange={v => setPos({ graphY: v })} />
+
+        <SliderInput label="Graph height" min={-0.15} max={0.25} step={0.01}
+          value={positions.graphHeight}
+          format={v => v === 0 ? 'default' : `${v > 0 ? '+' : ''}${Math.round(v * 100)}%`}
+          onChange={v => setPos({ graphHeight: v })} />
+
+        <SliderInput label="Description position" min={-0.3} max={0.3} step={0.01}
+          value={positions.descriptionY}
+          format={v => v === 0 ? 'default' : `${v > 0 ? '+' : ''}${Math.round(v * 100)}%`}
+          onChange={v => setPos({ descriptionY: v })} />
+
+        <SliderInput label="Metrics row position" min={-0.4} max={0.05} step={0.01}
+          value={positions.metricsY}
+          format={v => v === 0 ? 'default' : `${v > 0 ? '+' : ''}${Math.round(v * 100)}%`}
+          onChange={v => setPos({ metricsY: v })} />
+      </div>
+
+      <button onClick={reset}
+        className="font-display w-full py-2 text-xs font-semibold uppercase tracking-wider"
+        style={{ background: BRAND.white, border: `1px solid ${BRAND.line}` }}>
+        Reset all to defaults
+      </button>
+
+      <div className="p-2 text-[10px] leading-relaxed" style={{ background: BRAND.white, border: `1px solid ${BRAND.line}`, color: BRAND.muted }}>
+        <strong className="font-display uppercase tracking-wider" style={{ color: BRAND.ink }}>Tip:</strong> if annotations are covering the graph, push the graph down (positive value) or shrink the description area to make room.
       </div>
     </div>
   );
