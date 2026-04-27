@@ -1045,19 +1045,54 @@ export default function App() {
     if (!name) return;
     try {
       const all = JSON.parse(localStorage.getItem('paceon:projects') || '{}');
-      // Strip any transient image fields. Logo state is already image-free.
+
+      // Decide whether to persist the background. Object URLs are session-only,
+      // so we need the dataUrl. Skip persistence if file is too large for localStorage.
+      let bgToSave = null;
+      let bgWarning = '';
+      if (bgFile) {
+        if (bgFile.dataUrl) {
+          if (bgFile.sizeMB && bgFile.sizeMB > 4.5) {
+            bgWarning = ` (background too large to save — ${bgFile.sizeMB.toFixed(1)}MB)`;
+          } else {
+            // Persist only the dataUrl + metadata, not the object URL (which won't be valid later)
+            bgToSave = { type: bgFile.type, dataUrl: bgFile.dataUrl, mimeType: bgFile.mimeType };
+          }
+        } else {
+          bgWarning = ' (background not saved — re-upload to enable)';
+        }
+      }
+
       const serialisable = {
         ...project,
         logo: { variant: project.logo.variant, hasCustom: project.logo.hasCustom },
-        _bgFile: bgFile,
+        _bgFile: bgToSave,
       };
       all[name] = serialisable;
       localStorage.setItem('paceon:projects', JSON.stringify(all));
       setSavedProjects(Object.keys(all));
-      setExportStatus(`Saved “${name}”`);
-      setTimeout(() => setExportStatus(''), 2000);
+      setExportStatus(`Saved “${name}”${bgWarning}`);
+      setTimeout(() => setExportStatus(''), 4000);
     } catch (e) {
-      setExportStatus('Save failed');
+      // QuotaExceededError most commonly here — try saving without background
+      if (e.name === 'QuotaExceededError') {
+        try {
+          const all = JSON.parse(localStorage.getItem('paceon:projects') || '{}');
+          all[name] = {
+            ...project,
+            logo: { variant: project.logo.variant, hasCustom: project.logo.hasCustom },
+            _bgFile: null,
+          };
+          localStorage.setItem('paceon:projects', JSON.stringify(all));
+          setSavedProjects(Object.keys(all));
+          setExportStatus(`Saved “${name}” without background (storage full)`);
+          setTimeout(() => setExportStatus(''), 4000);
+        } catch (e2) {
+          setExportStatus('Save failed — storage full');
+        }
+      } else {
+        setExportStatus('Save failed');
+      }
     }
   };
 
@@ -1073,7 +1108,27 @@ export default function App() {
         hasCustom: proj.logo?.hasCustom && customLogo.current ? true : false,
       };
       setProject(migrateProject({ ...proj, logo: restoredLogo }));
-      if (_bgFile) setBgFile(_bgFile);
+
+      // Rehydrate background from dataUrl into a fresh object URL for this session
+      if (_bgFile && _bgFile.dataUrl) {
+        // Convert dataUrl → Blob → object URL so video/image elements can stream it
+        try {
+          const [meta, b64] = _bgFile.dataUrl.split(',');
+          const mime = _bgFile.mimeType || meta.match(/:(.*?);/)?.[1] || 'application/octet-stream';
+          const bin = atob(b64);
+          const len = bin.length;
+          const bytes = new Uint8Array(len);
+          for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+          const blob = new Blob([bytes], { type: mime });
+          const url = URL.createObjectURL(blob);
+          setBgFile({ type: _bgFile.type, url, dataUrl: _bgFile.dataUrl, mimeType: mime });
+        } catch (err) {
+          // dataUrl couldn't be parsed; clear background gracefully
+          setBgFile(null);
+        }
+      } else {
+        setBgFile(null);
+      }
     } catch (e) {}
   };
 
@@ -1091,8 +1146,24 @@ export default function App() {
   const handleBackgroundUpload = (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    const type = file.type.startsWith('video/') ? 'video' : 'image';
+    const mimeType = file.type;
+
+    // Use object URL for the live session (fast, no memory bloat)
     const url = URL.createObjectURL(file);
-    setBgFile({ type: file.type.startsWith('video/') ? 'video' : 'image', url });
+
+    // Also read as base64 so it can survive save/load
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result;
+      const sizeMB = (dataUrl.length * 0.75) / (1024 * 1024); // base64 → bytes approx
+      setBgFile({ type, url, dataUrl, mimeType, sizeMB });
+    };
+    reader.onerror = () => {
+      // Fall back to object URL only — won't persist but works in session
+      setBgFile({ type, url, mimeType });
+    };
+    reader.readAsDataURL(file);
   };
 
   const handleLogoUpload = (e) => {
@@ -1314,7 +1385,7 @@ export default function App() {
 
           <div className="p-4 border-b" style={{ borderColor: BRAND.line }}>
             <label className="font-display text-xs font-bold uppercase tracking-widest mb-2 block" style={{ color: BRAND.muted }}>Title</label>
-            <input value={project.title} onChange={e => updateProject({ title: e.target.value })}
+            <DebouncedInput value={project.title} onCommit={v => updateProject({ title: v })}
               className="w-full px-3 py-2 text-sm border" style={{ borderColor: BRAND.line, background: BRAND.white }} />
           </div>
 
@@ -1325,7 +1396,7 @@ export default function App() {
                 <Sparkles size={10} /> Auto-draft
               </button>
             </div>
-            <textarea value={project.description} onChange={e => updateProject({ description: e.target.value })} rows={5}
+            <DebouncedTextarea value={project.description} onCommit={v => updateProject({ description: v })} rows={5}
               className="w-full px-3 py-2 text-sm border" style={{ borderColor: BRAND.line, background: BRAND.white, resize: 'vertical' }} />
           </div>
 
@@ -1336,7 +1407,7 @@ export default function App() {
                 <Sparkles size={10} /> Auto-draft
               </button>
             </div>
-            <textarea value={project.caption} onChange={e => updateProject({ caption: e.target.value })} rows={8}
+            <DebouncedTextarea value={project.caption} onCommit={v => updateProject({ caption: v })} rows={8}
               className="w-full px-3 py-2 text-xs border font-mono" style={{ borderColor: BRAND.line, background: BRAND.white, resize: 'vertical' }} />
             {project.caption && (
               <button onClick={() => navigator.clipboard.writeText(project.caption)}
@@ -1484,8 +1555,8 @@ function SegmentEditor({ segment, sport, updateSegment, removeSegment, moveSegme
     <div className="bg-white border p-2" style={{ borderColor: BRAND.line }}>
       <div className="flex items-center gap-1 mb-1.5">
         <div style={{ width: 6, height: 22, background: zone.color }} />
-        <input value={segment.label}
-          onChange={e => updateSegment(segment.id, { label: e.target.value })}
+        <DebouncedInput value={segment.label}
+          onCommit={v => updateSegment(segment.id, { label: v })}
           className="flex-1 font-display text-xs font-semibold uppercase tracking-wide bg-transparent" />
         {!isChild && (
           <>
@@ -1607,13 +1678,22 @@ function BackgroundPanel({ project, updateProject, bgFile, setBgFile, handleBack
           <input type="file" accept="image/*,video/*" onChange={handleBackgroundUpload} className="hidden" />
         </label>
         {bgFile && (
-          <div className="mt-2 flex items-center justify-between text-[11px]">
-            <div className="flex items-center gap-1.5">
-              {bgFile.type === 'video' ? <Video size={12} /> : <ImageIcon size={12} />}
-              <span style={{ color: BRAND.muted }}>{bgFile.type} loaded</span>
+          <div className="mt-2 space-y-1">
+            <div className="flex items-center justify-between text-[11px]">
+              <div className="flex items-center gap-1.5">
+                {bgFile.type === 'video' ? <Video size={12} /> : <ImageIcon size={12} />}
+                <span style={{ color: BRAND.muted }}>
+                  {bgFile.type} loaded{bgFile.sizeMB ? ` · ${bgFile.sizeMB.toFixed(1)}MB` : ''}
+                </span>
+              </div>
+              <button onClick={() => setBgFile(null)} className="font-display font-semibold uppercase tracking-wider text-[10px]"
+                style={{ color: '#a13d00' }}>Remove</button>
             </div>
-            <button onClick={() => setBgFile(null)} className="font-display font-semibold uppercase tracking-wider text-[10px]"
-              style={{ color: '#a13d00' }}>Remove</button>
+            {bgFile.sizeMB && bgFile.sizeMB > 4.5 && (
+              <div className="text-[10px] p-1.5" style={{ background: '#fff4ef', color: '#7a2d00', border: `1px solid #f0d0c0` }}>
+                Too large to save with project — works in this session only. Use a smaller file or trim the video to persist.
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -1659,6 +1739,85 @@ function SliderInput({ label, min, max, step, value, onChange, format }) {
         onChange={e => onChange(parseFloat(e.target.value))}
         className="w-full" style={{ accentColor: BRAND.orange }} />
     </div>
+  );
+}
+
+/* DebouncedTextarea / DebouncedInput
+   Keep the user's typing in local state and only push to the parent on:
+   - 400ms of inactivity (so the canvas redraws shortly after they pause)
+   - Blur (so the value is committed when they move on)
+   This prevents any race conditions between rapid typing and other state updates,
+   and keeps the canvas snappy because it isn't re-rendering on every keystroke.
+   The component also re-syncs from props when the external value changes
+   (e.g. auto-draft, preset load, project switch). */
+function DebouncedTextarea({ value, onCommit, debounceMs = 400, ...rest }) {
+  const [local, setLocal] = useState(value ?? '');
+  const lastExternal = useRef(value);
+  const timer = useRef(null);
+
+  useEffect(() => {
+    // External value changed (preset load, auto-draft) — adopt it
+    if (value !== lastExternal.current) {
+      lastExternal.current = value;
+      setLocal(value ?? '');
+    }
+  }, [value]);
+
+  const commit = (v) => {
+    lastExternal.current = v;
+    onCommit(v);
+  };
+
+  return (
+    <textarea
+      {...rest}
+      value={local}
+      onChange={(e) => {
+        const v = e.target.value;
+        setLocal(v);
+        if (timer.current) clearTimeout(timer.current);
+        timer.current = setTimeout(() => commit(v), debounceMs);
+      }}
+      onBlur={() => {
+        if (timer.current) { clearTimeout(timer.current); timer.current = null; }
+        if (local !== lastExternal.current) commit(local);
+      }}
+    />
+  );
+}
+
+function DebouncedInput({ value, onCommit, debounceMs = 400, ...rest }) {
+  const [local, setLocal] = useState(value ?? '');
+  const lastExternal = useRef(value);
+  const timer = useRef(null);
+
+  useEffect(() => {
+    if (value !== lastExternal.current) {
+      lastExternal.current = value;
+      setLocal(value ?? '');
+    }
+  }, [value]);
+
+  const commit = (v) => {
+    lastExternal.current = v;
+    onCommit(v);
+  };
+
+  return (
+    <input
+      {...rest}
+      value={local}
+      onChange={(e) => {
+        const v = e.target.value;
+        setLocal(v);
+        if (timer.current) clearTimeout(timer.current);
+        timer.current = setTimeout(() => commit(v), debounceMs);
+      }}
+      onBlur={() => {
+        if (timer.current) { clearTimeout(timer.current); timer.current = null; }
+        if (local !== lastExternal.current) commit(local);
+      }}
+    />
   );
 }
 
@@ -1755,7 +1914,9 @@ function AnnotatePanel({ project, flat, addAnnotation, updateAnnotation, removeA
                 <option value="free">— Free position (drag tip) —</option>
               </select>
 
-              <textarea value={a.text} onChange={e => updateAnnotation(a.id, { text: e.target.value })}
+              <DebouncedTextarea
+                value={a.text}
+                onCommit={(text) => updateAnnotation(a.id, { text })}
                 rows={4}
                 className="w-full text-xs px-1.5 py-1 border" style={{ borderColor: BRAND.line, resize: 'vertical' }} />
             </div>
@@ -1795,9 +1956,9 @@ function AnnotatePanel({ project, flat, addAnnotation, updateAnnotation, removeA
                     <div className="font-display text-[10px] uppercase tracking-wider mb-1" style={{ color: BRAND.muted }}>
                       Custom label (blank = use preset)
                     </div>
-                    <input value={a.customLabel || ''}
+                    <DebouncedInput value={a.customLabel || ''}
                       placeholder={ANNOTATION_PRESETS[a.style].label}
-                      onChange={e => updateAnnotation(a.id, { customLabel: e.target.value })}
+                      onCommit={v => updateAnnotation(a.id, { customLabel: v })}
                       className="w-full text-xs px-1.5 py-1 border" style={{ borderColor: BRAND.line }} />
                   </div>
                 )}
