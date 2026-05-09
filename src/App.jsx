@@ -284,6 +284,36 @@ function autoDraftCaption(title, segments, sport, description) {
   return `${title || "This week's key session"}\n\n${description}\n\n— Duration: ${fmtDuration(totalMin)}\n— IF: ${ifLow.toFixed(2)}–${ifHigh.toFixed(2)}\n— TSS: ${Math.round(tssLow)}–${Math.round(tssHigh)}\n\nPaceOn — evidence-driven coaching for athletes balancing ambition with life.\n\n#paceon ${tags}`;
 }
 
+/* Auto-draft a detailed plan from the workout structure. Walks the segments tree
+   and produces a hierarchical text breakdown — repeats become "N × ROUND" with
+   their child steps indented underneath. The renderer (drawDetailedPlan) reads
+   leading spaces to indent visually with bullets. */
+function autoDraftDetailedPlan(segments, sport) {
+  const unit = sport === 'cycling' ? '% FTP' : '% TP';
+  const segLine = (s) => {
+    const intensity = s.intensityLow === s.intensityHigh
+      ? `${s.intensityLow}${unit}`
+      : `${s.intensityLow}–${s.intensityHigh}${unit}`;
+    const zone = getZoneFor((s.intensityLow + s.intensityHigh) / 2, sport);
+    const zoneTag = ` (${zone.name.split(' ')[0]})`;
+    return `${s.label} — ${fmtDuration(s.duration)} @ ${intensity}${zoneTag}`;
+  };
+
+  const out = [];
+  segments.forEach(s => {
+    if (s.type === 'repeat') {
+      out.push(`${s.count} × Round`);
+      s.children.forEach(c => out.push('  ' + segLine(c)));
+      out.push(''); // blank line between blocks
+    } else {
+      out.push(segLine(s));
+    }
+  });
+  // Trim trailing blank lines
+  while (out.length && out[out.length - 1] === '') out.pop();
+  return out.join('\n');
+}
+
 // Migrate older annotations to include style fields with defaults
 function migrateAnnotation(a) {
   const preset = ANNOTATION_PRESETS[a.style] || ANNOTATION_PRESETS.coach;
@@ -306,6 +336,8 @@ function migrateAnnotation(a) {
 
 function migrateProject(p) {
   return {
+    detailedPlan: '',
+    showGraphLabels: false,
     ...p,
     positions: { ...DEFAULT_POSITIONS, ...(p.positions || {}) },
     annotations: (p.annotations || []).map(migrateAnnotation),
@@ -314,7 +346,7 @@ function migrateProject(p) {
 
 // ---------- Canvas drawing ----------
 function drawCanvas(ctx, opts) {
-  const { project, format, sport, mediaEl, mediaType, hoverAnno } = opts;
+  const { project, format, sport, mediaEl, mediaType, hoverAnno, currentPage = 1 } = opts;
   const W = format.w, H = format.h;
   ctx.clearRect(0, 0, W, H);
   ctx.fillStyle = BRAND.black;
@@ -365,17 +397,24 @@ function drawCanvas(ctx, opts) {
   const pos = project.positions || DEFAULT_POSITIONS;
   drawLogo(ctx, project, W, H, pad);
 
+  // Title + graph share identical positioning across both pages so the carousel
+  // transition feels seamless. The `positions` offsets apply to both.
   const titleSize = Math.round(W * 0.072);
   const baseTitleY = pad + Math.round(W * 0.13);
   const titleY = baseTitleY + Math.round(pos.titleY * H);
 
+  // Page indicator + kicker
   const kickSize = Math.round(W * 0.022);
   ctx.font = `600 ${kickSize}px "League Spartan", system-ui, sans-serif`;
   ctx.fillStyle = BRAND.orange;
   ctx.textBaseline = 'top';
   ctx.textAlign = 'left';
-  ctx.fillText('KEY SESSION  /  ' + (sport === 'cycling' ? 'CYCLING' : 'RUNNING'), pad, titleY - kickSize - 12);
+  const kickerText = currentPage === 1
+    ? `KEY SESSION  /  ${sport === 'cycling' ? 'CYCLING' : 'RUNNING'}`
+    : `SESSION DETAIL  /  ${sport === 'cycling' ? 'CYCLING' : 'RUNNING'}`;
+  ctx.fillText(kickerText, pad, titleY - kickSize - 12);
 
+  // Title (same position, same content on both pages)
   ctx.font = `700 ${titleSize}px "League Spartan", system-ui, sans-serif`;
   ctx.fillStyle = BRAND.white;
   const titleLines = wrapText(ctx, (project.title || 'Workout Title').toUpperCase(), W - pad * 2, 2);
@@ -385,6 +424,7 @@ function drawCanvas(ctx, opts) {
     cy += titleSize * 1.05;
   });
 
+  // Graph — same position and height on both pages
   const flat = flattenSegments(project.segments);
   let baseGraphHeight;
   if (project.layout === 'graphLed') baseGraphHeight = Math.round(H * 0.32);
@@ -394,13 +434,23 @@ function drawCanvas(ctx, opts) {
   const baseGraphTop = cy + Math.round(W * 0.06);
   const graphTop = baseGraphTop + Math.round(pos.graphY * H);
   const graphRect = { x: pad, y: graphTop, w: W - pad * 2, h: graphHeight };
-  drawGraph(ctx, graphRect, flat, sport, project.graphStyle);
-  drawAnnotations(ctx, project.annotations, flat, graphRect, W, hoverAnno);
+  drawGraph(ctx, graphRect, flat, sport, project.graphStyle, !!project.showGraphLabels);
 
-  const baseDescTop = graphTop + graphHeight + Math.round(W * 0.06);
-  const descTop = baseDescTop + Math.round(pos.descriptionY * H);
-  drawDescription(ctx, project.description, pad, descTop, W - pad * 2, W);
+  // Annotations only on page 2 (the detail page)
+  if (currentPage === 2) {
+    drawAnnotations(ctx, project.annotations, flat, graphRect, W, hoverAnno);
+  }
 
+  // Body content differs by page
+  const baseBodyTop = graphTop + graphHeight + Math.round(W * 0.06);
+  const bodyTop = baseBodyTop + Math.round(pos.descriptionY * H);
+  if (currentPage === 1) {
+    drawDescription(ctx, project.description, pad, bodyTop, W - pad * 2, W);
+  } else {
+    drawDetailedPlan(ctx, project.detailedPlan, pad, bodyTop, W - pad * 2, W, H);
+  }
+
+  // Metrics row + footer wordmark on both pages
   const metricsOffset = Math.round(pos.metricsY * H);
   drawCalculations(ctx, flat, sport, pad, H, W, metricsOffset);
 
@@ -408,6 +458,23 @@ function drawCanvas(ctx, opts) {
   ctx.fillStyle = 'rgba(255,255,255,0.55)';
   ctx.textAlign = 'right';
   ctx.fillText('paceon.com.au', W - pad, H - pad - Math.round(W * 0.07) + metricsOffset);
+
+  // Page indicator dots — bottom centre, subtle
+  drawPageIndicator(ctx, currentPage, W, H, pad);
+}
+
+function drawPageIndicator(ctx, currentPage, W, H, pad) {
+  const cx = W / 2;
+  const y = H - pad - Math.round(W * 0.025);
+  const r = Math.round(W * 0.008);
+  const gap = r * 3;
+  for (let p = 1; p <= 2; p++) {
+    const x = cx + (p === 1 ? -gap / 2 : gap / 2);
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = p === currentPage ? BRAND.orange : 'rgba(255,255,255,0.35)';
+    ctx.fill();
+  }
 }
 
 function wrapText(ctx, text, maxWidth, maxLines) {
@@ -470,7 +537,7 @@ function drawLogo(ctx, project, W, H, pad) {
   }
 }
 
-function drawGraph(ctx, rect, flatSegs, sport, style) {
+function drawGraph(ctx, rect, flatSegs, sport, style, showLabels = false) {
   const { x, y, w, h } = rect;
   ctx.fillStyle = 'rgba(255,255,255,0.06)';
   roundRect(ctx, x, y, w, h, 8);
@@ -493,8 +560,10 @@ function drawGraph(ctx, rect, flatSegs, sport, style) {
   const maxIntensity = Math.max(140, ...flatSegs.map(s => s.intensityHigh));
   const minPx = 1;
   const axisPad = Math.round(h * 0.12);
-  const innerY = y + 8;
-  const innerH = h - axisPad - 8;
+  // Reserve a bit more headroom inside the graph for above-bar labels
+  const labelPad = showLabels ? Math.round(h * 0.18) : 0;
+  const innerY = y + 8 + labelPad;
+  const innerH = h - axisPad - 8 - labelPad;
   const innerX = x + 8;
   const innerW = w - 16;
 
@@ -513,6 +582,8 @@ function drawGraph(ctx, rect, flatSegs, sport, style) {
   });
   ctx.setLineDash([]);
 
+  // First pass: draw the bars and capture label-anchor positions
+  const labelAnchors = [];
   let cx = innerX;
   flatSegs.forEach((s) => {
     const segW = Math.max(minPx, (s.duration / totalMin) * innerW);
@@ -551,9 +622,11 @@ function drawGraph(ctx, rect, flatSegs, sport, style) {
       ctx.fillRect(drawX, innerY + innerH - highH, drawW, 2);
     }
 
+    labelAnchors.push({ centreX: cx + segW / 2, segW, segment: s, topY: innerY + innerH - highH });
     cx += segW;
   });
 
+  // Y-axis reference
   ctx.fillStyle = 'rgba(255,255,255,0.5)';
   ctx.font = `500 ${Math.round(w * 0.018)}px Roboto, system-ui, sans-serif`;
   ctx.textAlign = 'left';
@@ -565,12 +638,50 @@ function drawGraph(ctx, rect, flatSegs, sport, style) {
     ctx.fillText(`${level}${level === 100 ? unit : ''}`, innerX + 4, yL);
   });
 
+  // Time axis
   ctx.font = `500 ${Math.round(w * 0.02)}px Roboto, system-ui, sans-serif`;
   ctx.textAlign = 'left';
   ctx.textBaseline = 'top';
   ctx.fillText('0:00', innerX, innerY + innerH + 6);
   ctx.textAlign = 'right';
   ctx.fillText(fmtDuration(totalMin), innerX + innerW, innerY + innerH + 6);
+
+  // Per-segment labels (time + intensity) above each bar.
+  // Skips segments too narrow to fit a readable label, with optional decimation
+  // when many narrow segments cluster (e.g. inside a repeat block).
+  if (showLabels) {
+    const labelSize = Math.round(w * 0.018);
+    const subSize = Math.round(w * 0.014);
+    const minWidthForLabel = Math.max(38, labelSize * 3.5);
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+
+    // Decimate: when many segments are below threshold and identical, label only the first
+    let lastLabelEndX = -Infinity;
+    labelAnchors.forEach(({ centreX, segW, segment, topY }) => {
+      if (segW < minWidthForLabel) return;
+      // Avoid overlap: skip if too close to the previous label
+      if (centreX - lastLabelEndX < minWidthForLabel * 0.45) return;
+
+      const intensityText = segment.intensityLow === segment.intensityHigh
+        ? `${segment.intensityLow}%`
+        : `${segment.intensityLow}–${segment.intensityHigh}%`;
+      const timeText = fmtDuration(segment.duration);
+
+      // Two-line label: intensity (bold, white) above time (smaller, muted)
+      ctx.font = `700 ${labelSize}px "League Spartan", system-ui, sans-serif`;
+      ctx.fillStyle = BRAND.white;
+      const yIntensity = topY - 6;
+      ctx.fillText(intensityText, centreX, yIntensity);
+
+      ctx.font = `500 ${subSize}px Roboto, system-ui, sans-serif`;
+      ctx.fillStyle = 'rgba(255,255,255,0.6)';
+      ctx.fillText(timeText, centreX, yIntensity - labelSize - 2);
+
+      lastLabelEndX = centreX + segW / 2;
+    });
+  }
 }
 
 function drawAnnotations(ctx, annotations, flatSegs, graphRect, W, hoverAnno) {
@@ -693,6 +804,66 @@ function drawDescription(ctx, text, x, y, w, W) {
   });
 }
 
+/* Detailed plan — page 2 body. Smaller type than description, more lines fit,
+   supports manual line breaks. Hierarchical indent: lines starting with "  "
+   render at the indent depth × indent step, useful for repeat-block children. */
+function drawDetailedPlan(ctx, text, x, y, w, W, H) {
+  if (!text) return;
+  const size = Math.round(W * 0.022);
+  const lineHeight = size * 1.45;
+  const indentStep = Math.round(W * 0.025);
+  ctx.font = `400 ${size}px Roboto, system-ui, sans-serif`;
+  ctx.fillStyle = 'rgba(255,255,255,0.94)';
+  ctx.textBaseline = 'top';
+  ctx.textAlign = 'left';
+
+  // Available height: from y down to roughly the start of the metrics row
+  const maxBottom = H - Math.round(W * 0.16);
+  const maxLines = Math.max(1, Math.floor((maxBottom - y) / lineHeight));
+
+  const rendered = [];
+  text.split('\n').forEach(rawLine => {
+    // Detect leading whitespace as indent depth (each two spaces = one level)
+    const leadingSpaces = rawLine.length - rawLine.trimStart().length;
+    const indentDepth = Math.floor(leadingSpaces / 2);
+    const content = rawLine.trim();
+    const indentPx = indentDepth * indentStep;
+
+    if (!content) {
+      rendered.push({ text: '', indent: 0 }); // blank line
+      return;
+    }
+    // Wrap each paragraph respecting available width minus indent
+    const wrapped = wrapTextAll(ctx, content, w - indentPx);
+    wrapped.forEach((line, i) => {
+      // Continuation lines (after the first) get an extra small indent so they read as one paragraph
+      const px = indentPx + (i === 0 ? 0 : indentStep * 0.5);
+      rendered.push({ text: line, indent: px });
+    });
+  });
+
+  let cy = y;
+  rendered.slice(0, maxLines).forEach(({ text: line, indent }) => {
+    if (line) {
+      // Bullet for indented (child) lines
+      if (indent > 0) {
+        ctx.fillStyle = BRAND.orange;
+        ctx.fillText('·', x + indent - Math.round(W * 0.012), cy);
+        ctx.fillStyle = 'rgba(255,255,255,0.94)';
+      }
+      ctx.fillText(line, x + indent, cy);
+    }
+    cy += lineHeight;
+  });
+
+  // Ellipsis indicator if we ran out of room
+  if (rendered.length > maxLines) {
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.font = `500 ${Math.round(W * 0.018)}px Roboto, system-ui, sans-serif`;
+    ctx.fillText('…', x, cy);
+  }
+}
+
 function drawCalculations(ctx, flatSegs, sport, pad, H, W, yOffset = 0) {
   if (!flatSegs.length) return;
   const m = calculateMetrics(flatSegs, sport);
@@ -775,8 +946,10 @@ const DEFAULT_PROJECT = {
   title: 'Zone 2 with Spikes',
   segments: PRESETS.cycling[2].segments,
   description: PRESETS.cycling[2].description,
+  detailedPlan: '',
   caption: '',
   annotations: [],
+  showGraphLabels: false,
   background: { tint: 0.55, gradient: true, gradientTop: 0.4, gradientBottom: 0.7 },
   // logo state stripped of `image` — image lives in a ref, never in saved JSON
   logo: { variant: 'white', hasCustom: false },
@@ -799,6 +972,7 @@ export default function App() {
   );
   const [zoomed, setZoomed] = useState(false); // mobile fullscreen canvas
   const [mobileControlsOpen, setMobileControlsOpen] = useState(false); // collapsible toggles in mobile header
+  const [currentPage, setCurrentPage] = useState(1); // 1 = overview (description), 2 = detail (plan + annotations)
 
   useEffect(() => {
     const onResize = () => setIsMobile(window.innerWidth < 900);
@@ -892,13 +1066,14 @@ export default function App() {
           project: projectWithLogoImage,
           format, sport: project.sport,
           mediaEl: mediaRef.current, mediaType: bgFile?.type || null, hoverAnno,
+          currentPage,
         });
       }
       animRef.current = requestAnimationFrame(render);
     };
     render();
     return () => { mounted = false; if (animRef.current) cancelAnimationFrame(animRef.current); };
-  }, [project, format, bgFile, hoverAnno, activeLogoImage]);
+  }, [project, format, bgFile, hoverAnno, activeLogoImage, currentPage]);
 
   const getGraphRect = useCallback(() => {
     const c = canvasRef.current;
@@ -1314,26 +1489,69 @@ export default function App() {
   };
 
   // Export
+  // Render a single page to an offscreen canvas at full output resolution.
+  // Returns a Promise that resolves to a Blob (PNG).
+  const renderPageToBlob = (pageNum) => new Promise((resolve, reject) => {
+    const off = document.createElement('canvas');
+    off.width = format.w;
+    off.height = format.h;
+    const ctx = off.getContext('2d');
+    const projectWithLogoImage = { ...project, logo: { ...project.logo, image: activeLogoImage } };
+    drawCanvas(ctx, {
+      project: projectWithLogoImage,
+      format, sport: project.sport,
+      mediaEl: mediaRef.current, mediaType: bgFile?.type || null,
+      hoverAnno: null, // never show hover indicator in exports
+      currentPage: pageNum,
+    });
+    off.toBlob((blob) => {
+      if (blob) resolve(blob); else reject(new Error('toBlob failed'));
+    }, 'image/png');
+  });
+
+  const downloadBlob = (blob, filename) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   const exportImage = () => {
     flushPendingEdits();
-    setExportStatus('Rendering image...');
+    setExportStatus(`Rendering page ${currentPage}...`);
     canvasRef.current.toBlob((blob) => {
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `paceon-${project.format}-${Date.now()}.png`;
-      a.click();
-      URL.revokeObjectURL(url);
-      setExportStatus('Image exported');
+      downloadBlob(blob, `paceon-${project.format}-page${currentPage}-${Date.now()}.png`);
+      setExportStatus(`Page ${currentPage} exported`);
       setTimeout(() => setExportStatus(''), 2000);
     }, 'image/png');
   };
 
-  const exportVideo = () => {
+  const exportBothImages = async () => {
     flushPendingEdits();
+    setExportStatus('Rendering both pages...');
+    try {
+      const ts = Date.now();
+      const blob1 = await renderPageToBlob(1);
+      downloadBlob(blob1, `paceon-${project.format}-page1-${ts}.png`);
+      // Tiny delay so the second download isn't blocked by the browser
+      await new Promise(r => setTimeout(r, 250));
+      const blob2 = await renderPageToBlob(2);
+      downloadBlob(blob2, `paceon-${project.format}-page2-${ts}.png`);
+      setExportStatus('Both pages exported');
+      setTimeout(() => setExportStatus(''), 2500);
+    } catch (e) {
+      setExportStatus('Export failed');
+      setTimeout(() => setExportStatus(''), 2500);
+    }
+  };
+
+  // Record a video of the currently-displayed canvas for the configured loop length.
+  // Caller decides which page is showing (we don't switch pages mid-record).
+  const recordVideoForCurrentCanvas = (suffix) => new Promise((resolve, reject) => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
-    setExportStatus(`Recording ${project.videoLoopLength}s loop...`);
+    if (!canvas) return reject(new Error('no canvas'));
 
     const mimeCandidates = [
       'video/mp4;codecs=avc1', 'video/mp4',
@@ -1343,10 +1561,7 @@ export default function App() {
     for (const m of mimeCandidates) {
       if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m)) { mime = m; break; }
     }
-    if (!mime) {
-      setExportStatus('Video recording not supported in this browser');
-      return;
-    }
+    if (!mime) return reject(new Error('no supported mime'));
 
     const stream = canvas.captureStream(30);
     const chunks = [];
@@ -1354,15 +1569,9 @@ export default function App() {
     recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
     recorder.onstop = () => {
       const blob = new Blob(chunks, { type: mime });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
       const ext = mime.includes('mp4') ? 'mp4' : 'webm';
-      a.href = url;
-      a.download = `paceon-${project.format}-${Date.now()}.${ext}`;
-      a.click();
-      URL.revokeObjectURL(url);
-      setExportStatus(`Video exported (.${ext})${ext === 'webm' ? ' — convert to MP4 for Instagram' : ''}`);
-      setTimeout(() => setExportStatus(''), 4000);
+      downloadBlob(blob, `paceon-${project.format}-${suffix}-${Date.now()}.${ext}`);
+      resolve(ext);
     };
 
     if (mediaRef.current && bgFile?.type === 'video') {
@@ -1372,10 +1581,51 @@ export default function App() {
     recorder.start();
     recorderRef.current = recorder;
     setTimeout(() => { try { recorder.stop(); } catch (e) {} }, project.videoLoopLength * 1000);
+  });
+
+  const exportVideo = () => {
+    flushPendingEdits();
+    setExportStatus(`Recording page ${currentPage} (${project.videoLoopLength}s)...`);
+    recordVideoForCurrentCanvas(`page${currentPage}`)
+      .then(ext => {
+        setExportStatus(`Video exported (.${ext})${ext === 'webm' ? ' — convert to MP4 for Instagram' : ''}`);
+        setTimeout(() => setExportStatus(''), 4000);
+      })
+      .catch(() => setExportStatus('Video recording not supported'));
+  };
+
+  const exportBothVideos = async () => {
+    flushPendingEdits();
+    const remember = currentPage;
+    try {
+      // Page 1 first
+      setCurrentPage(1);
+      // Wait one frame so the canvas reflects the page change
+      await new Promise(r => requestAnimationFrame(r));
+      await new Promise(r => setTimeout(r, 100)); // let render loop settle
+      setExportStatus(`Recording page 1 of 2 (${project.videoLoopLength}s)...`);
+      await recordVideoForCurrentCanvas('page1');
+
+      // Page 2
+      setCurrentPage(2);
+      await new Promise(r => requestAnimationFrame(r));
+      await new Promise(r => setTimeout(r, 100));
+      setExportStatus(`Recording page 2 of 2 (${project.videoLoopLength}s)...`);
+      await recordVideoForCurrentCanvas('page2');
+
+      setCurrentPage(remember);
+      setExportStatus('Both videos exported');
+      setTimeout(() => setExportStatus(''), 3000);
+    } catch (e) {
+      setCurrentPage(remember);
+      setExportStatus('Video recording not supported');
+      setTimeout(() => setExportStatus(''), 3000);
+    }
   };
 
   const autoFillDescription = () => updateProject({ description: autoDraftDescription(project.title, project.segments, project.sport) });
   const autoFillCaption = () => updateProject({ caption: autoDraftCaption(project.title, project.segments, project.sport, project.description) });
+  const autoFillDetailedPlan = () => updateProject({ detailedPlan: autoDraftDetailedPlan(project.segments, project.sport) });
 
   // ---------- Subviews used by both desktop and mobile ----------
   const headerLogoBlock = (
@@ -1406,16 +1656,34 @@ export default function App() {
         style={{ border: `1px solid ${BRAND.line}` }}>
         <Save size={13} /> Save
       </button>
-      <button onClick={exportImage}
-        className="font-display flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-white"
-        style={{ background: BRAND.ink }}>
-        <Download size={13} /> Image
-      </button>
-      <button onClick={exportVideo}
-        className="font-display flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-white"
-        style={{ background: BRAND.orange }}>
-        <Video size={13} /> Video
-      </button>
+      <div className="flex" style={{ border: `1px solid ${BRAND.ink}` }}>
+        <button onClick={exportImage}
+          className="font-display flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-white"
+          style={{ background: BRAND.ink }}
+          title={`Export current page (page ${currentPage}) as PNG`}>
+          <Download size={13} /> Image
+        </button>
+        <button onClick={exportBothImages}
+          className="font-display px-2 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-white"
+          style={{ background: BRAND.ink, borderLeft: '1px solid rgba(255,255,255,0.2)' }}
+          title="Export both pages as separate PNGs">
+          ×2
+        </button>
+      </div>
+      <div className="flex" style={{ border: `1px solid ${BRAND.orange}` }}>
+        <button onClick={exportVideo}
+          className="font-display flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-white"
+          style={{ background: BRAND.orange }}
+          title={`Record current page (page ${currentPage}) as video`}>
+          <Video size={13} /> Video
+        </button>
+        <button onClick={exportBothVideos}
+          className="font-display px-2 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-white"
+          style={{ background: BRAND.orange, borderLeft: '1px solid rgba(255,255,255,0.25)' }}
+          title="Record both pages as separate videos (sequential)">
+          ×2
+        </button>
+      </div>
     </div>
   );
 
@@ -1442,8 +1710,8 @@ export default function App() {
       case 'annotate':   return <AnnotatePanel project={project} flat={flat} addAnnotation={addAnnotation} updateAnnotation={updateAnnotation} removeAnnotation={removeAnnotation} resetAnnotationStyle={resetAnnotationStyle} />;
       case 'layout':     return <LayoutPanel project={project} updateProject={updateProject} />;
       case 'presets':    return <PresetsPanel project={project} loadPreset={loadPreset} savedProjects={savedProjects} loadProject={loadProject} deleteProject={deleteProject} exportProjects={exportProjects} importProjects={importProjects} />;
-      case 'content':    return <ContentPanel project={project} updateProject={updateProject} metrics={metrics} autoFillDescription={autoFillDescription} autoFillCaption={autoFillCaption} />;
-      case 'export':     return <ExportPanel project={project} updateProject={updateProject} saveProject={saveProject} exportImage={exportImage} exportVideo={exportVideo} exportStatus={exportStatus} />;
+      case 'content':    return <ContentPanel project={project} updateProject={updateProject} metrics={metrics} autoFillDescription={autoFillDescription} autoFillCaption={autoFillCaption} autoFillDetailedPlan={autoFillDetailedPlan} />;
+      case 'export':     return <ExportPanel project={project} updateProject={updateProject} saveProject={saveProject} exportImage={exportImage} exportVideo={exportVideo} exportBothImages={exportBothImages} exportBothVideos={exportBothVideos} exportStatus={exportStatus} currentPage={currentPage} />;
       default:           return null;
     }
   };
@@ -1471,6 +1739,24 @@ export default function App() {
     onTouchCancel: handleCanvasTouchEnd,
     style: { width: '100%', height: '100%', display: 'block', cursor: draggingAnno ? 'grabbing' : 'default', touchAction: 'none' },
   };
+
+  // Page toggle — shown above the canvas in both layouts so the user can preview
+  // page 1 (overview) vs page 2 (detail) before exporting.
+  const pageToggle = (
+    <div className="flex items-center gap-1">
+      {[1, 2].map(p => (
+        <button key={p} onClick={() => setCurrentPage(p)}
+          className="font-display px-3 py-1 text-[10px] font-bold uppercase tracking-wider transition"
+          style={{
+            background: currentPage === p ? BRAND.orange : BRAND.white,
+            color: currentPage === p ? BRAND.white : BRAND.ink,
+            border: `1px solid ${currentPage === p ? BRAND.orange : BRAND.line}`,
+          }}>
+          Page {p} {p === 1 ? '· Overview' : '· Detail'}
+        </button>
+      ))}
+    </div>
+  );
 
   const tabsBar = (
     <div className="flex border-b flex-wrap" style={{ borderColor: BRAND.line }}>
@@ -1565,21 +1851,26 @@ export default function App() {
               </div>
             </div>
           ) : (
-            <div className="flex items-center justify-center px-3 py-2 flex-shrink-0 cursor-pointer"
-              style={{ background: '#e8e5dc', height: 'min(38vh, 80vw)' }}
-              onClick={() => setZoomed(true)}>
-              <div className="relative bg-black"
-                style={{
-                  aspectRatio: `${format.w} / ${format.h}`,
-                  maxHeight: '100%',
-                  maxWidth: '100%',
-                  height: format.h >= format.w ? '100%' : 'auto',
-                  width:  format.h >= format.w ? 'auto'  : '100%',
-                  boxShadow: '0 8px 24px rgba(0,0,0,0.18)',
-                }}>
-                <canvas {...canvasProps} />
+            <>
+              <div className="flex items-center justify-center px-3 py-2 flex-shrink-0 cursor-pointer"
+                style={{ background: '#e8e5dc', height: 'min(38vh, 80vw)' }}
+                onClick={() => setZoomed(true)}>
+                <div className="relative bg-black"
+                  style={{
+                    aspectRatio: `${format.w} / ${format.h}`,
+                    maxHeight: '100%',
+                    maxWidth: '100%',
+                    height: format.h >= format.w ? '100%' : 'auto',
+                    width:  format.h >= format.w ? 'auto'  : '100%',
+                    boxShadow: '0 8px 24px rgba(0,0,0,0.18)',
+                  }}>
+                  <canvas {...canvasProps} />
+                </div>
               </div>
-            </div>
+              <div className="flex justify-center py-1.5 flex-shrink-0" style={{ background: '#e8e5dc' }}>
+                {pageToggle}
+              </div>
+            </>
           )}
 
           {/* Tab bar + content */}
@@ -1603,17 +1894,18 @@ export default function App() {
           </div>
 
           {/* CENTER — canvas */}
-          <div className="flex flex-col items-center justify-center p-6" style={{ background: '#e8e5dc' }}>
+          <div className="flex flex-col items-center justify-center p-6 gap-3" style={{ background: '#e8e5dc' }}>
+            {pageToggle}
             <div className="relative bg-black"
               style={{
                 maxHeight: '100%', maxWidth: '100%',
                 aspectRatio: `${format.w} / ${format.h}`,
-                height: 'calc(100vh - 120px)',
+                height: 'calc(100vh - 160px)',
                 boxShadow: '0 20px 60px rgba(0,0,0,0.18), 0 4px 12px rgba(0,0,0,0.08)',
               }}>
               <canvas {...canvasProps} />
             </div>
-            <div className="mt-3 text-xs font-display uppercase tracking-widest" style={{ color: BRAND.muted }}>
+            <div className="text-xs font-display uppercase tracking-widest" style={{ color: BRAND.muted }}>
               {format.w} × {format.h}px · {format.label} · drag note bubbles to reposition
             </div>
           </div>
@@ -1622,6 +1914,7 @@ export default function App() {
           <div className="flex flex-col border-l overflow-y-auto scroll-thin" style={{ borderColor: BRAND.line, background: BRAND.panel }}>
             <ContentPanel project={project} updateProject={updateProject} metrics={metrics}
               autoFillDescription={autoFillDescription} autoFillCaption={autoFillCaption}
+              autoFillDetailedPlan={autoFillDetailedPlan}
               embedded={true} />
           </div>
         </div>
@@ -1838,6 +2131,21 @@ function StylePanel({ project, updateProject, handleLogoUpload, resetLogo }) {
               {s.label}
             </button>
           ))}
+        </div>
+      </div>
+
+      <div>
+        <div className="font-display text-xs font-bold uppercase tracking-widest mb-2" style={{ color: BRAND.muted }}>Segment Labels</div>
+        <div className="flex items-center gap-2 p-2.5" style={{ background: BRAND.white, border: `1px solid ${BRAND.line}` }}>
+          <input type="checkbox" id="showGraphLabels"
+            checked={!!project.showGraphLabels}
+            onChange={e => updateProject({ showGraphLabels: e.target.checked })} />
+          <label htmlFor="showGraphLabels" className="font-display text-xs uppercase tracking-wider flex-1 cursor-pointer">
+            Show time + intensity above each bar
+          </label>
+        </div>
+        <div className="text-[10px] mt-1.5" style={{ color: BRAND.muted }}>
+          Useful on Page 2. Narrow segments are skipped automatically to avoid overlap.
         </div>
       </div>
 
@@ -2067,13 +2375,18 @@ function AnnotatePanel({ project, flat, addAnnotation, updateAnnotation, removeA
 
   return (
     <div>
-      <div className="flex items-center justify-between mb-3">
-        <div className="font-display text-xs font-bold uppercase tracking-widest" style={{ color: BRAND.muted }}>Annotations</div>
+      <div className="flex items-center justify-between mb-2">
+        <div className="font-display text-xs font-bold uppercase tracking-widest" style={{ color: BRAND.muted }}>
+          Annotations <span style={{ color: BRAND.orange }}>· Page 2 only</span>
+        </div>
         <button onClick={() => setShowStylePicker(s => !s)}
           className="font-display flex items-center gap-1 text-[10px] uppercase tracking-wider font-semibold"
           style={{ color: BRAND.orange }}>
           <Plus size={11} /> Add
         </button>
+      </div>
+      <div className="text-[10px] mb-3 leading-relaxed" style={{ color: BRAND.muted }}>
+        Annotations only render on Page 2 (the detail slide). Switch the canvas page toggle to preview them.
       </div>
 
       {showStylePicker && (
@@ -2315,7 +2628,7 @@ function LayoutPanel({ project, updateProject }) {
 /* ContentPanel — title, description, caption, metrics.
    Used as the right sidebar on desktop (embedded=true → no outer padding/wrapping)
    and as the "Content" tab on mobile (embedded=false → tab-style spacing). */
-function ContentPanel({ project, updateProject, metrics, autoFillDescription, autoFillCaption, embedded = false }) {
+function ContentPanel({ project, updateProject, metrics, autoFillDescription, autoFillCaption, autoFillDetailedPlan, embedded = false }) {
   const sectionClass = embedded ? "p-4 border-b" : "pb-4 border-b mb-4";
   return (
     <div className={embedded ? "" : "space-y-0"}>
@@ -2332,20 +2645,42 @@ function ContentPanel({ project, updateProject, metrics, autoFillDescription, au
       </div>
 
       <div className={sectionClass} style={{ borderColor: BRAND.line }}>
-        <label className="font-display text-xs font-bold uppercase tracking-widest mb-2 block" style={{ color: BRAND.muted }}>Title</label>
+        <label className="font-display text-xs font-bold uppercase tracking-widest mb-2 block" style={{ color: BRAND.muted }}>Title <span style={{ color: BRAND.orange }}>· Both pages</span></label>
         <DebouncedInput value={project.title} onCommit={v => updateProject({ title: v })}
           className="w-full px-3 py-2 text-sm border" style={{ borderColor: BRAND.line, background: BRAND.white }} />
       </div>
 
       <div className={sectionClass} style={{ borderColor: BRAND.line }}>
         <div className="flex items-center justify-between mb-2">
-          <label className="font-display text-xs font-bold uppercase tracking-widest" style={{ color: BRAND.muted }}>Description</label>
+          <label className="font-display text-xs font-bold uppercase tracking-widest" style={{ color: BRAND.muted }}>
+            Description <span style={{ color: BRAND.orange }}>· Page 1</span>
+          </label>
           <button onClick={autoFillDescription} className="font-display flex items-center gap-1 text-[10px] uppercase tracking-wider font-semibold" style={{ color: BRAND.orange }}>
             <Sparkles size={10} /> Auto-draft
           </button>
         </div>
-        <DebouncedTextarea value={project.description} onCommit={v => updateProject({ description: v })} rows={5}
+        <DebouncedTextarea value={project.description} onCommit={v => updateProject({ description: v })} rows={4}
           className="w-full px-3 py-2 text-sm border" style={{ borderColor: BRAND.line, background: BRAND.white, resize: 'vertical' }} />
+        <div className="text-[10px] mt-1" style={{ color: BRAND.muted }}>
+          Short overview shown on the first slide.
+        </div>
+      </div>
+
+      <div className={sectionClass} style={{ borderColor: BRAND.line }}>
+        <div className="flex items-center justify-between mb-2">
+          <label className="font-display text-xs font-bold uppercase tracking-widest" style={{ color: BRAND.muted }}>
+            Detailed Plan <span style={{ color: BRAND.orange }}>· Page 2</span>
+          </label>
+          <button onClick={autoFillDetailedPlan} className="font-display flex items-center gap-1 text-[10px] uppercase tracking-wider font-semibold" style={{ color: BRAND.orange }}>
+            <Sparkles size={10} /> Auto-draft from structure
+          </button>
+        </div>
+        <DebouncedTextarea value={project.detailedPlan} onCommit={v => updateProject({ detailedPlan: v })} rows={8}
+          placeholder={"Add a structured breakdown of the session.\nIndent lines with two spaces to bullet them under the line above\n  e.g. as children of a repeat block."}
+          className="w-full px-3 py-2 text-xs border font-mono" style={{ borderColor: BRAND.line, background: BRAND.white, resize: 'vertical' }} />
+        <div className="text-[10px] mt-1" style={{ color: BRAND.muted }}>
+          Indent with two spaces for nested steps. Auto-draft generates this from your workout structure.
+        </div>
       </div>
 
       <div className={embedded ? "p-4" : ""}>
@@ -2355,7 +2690,7 @@ function ContentPanel({ project, updateProject, metrics, autoFillDescription, au
             <Sparkles size={10} /> Auto-draft
           </button>
         </div>
-        <DebouncedTextarea value={project.caption} onCommit={v => updateProject({ caption: v })} rows={8}
+        <DebouncedTextarea value={project.caption} onCommit={v => updateProject({ caption: v })} rows={6}
           className="w-full px-3 py-2 text-xs border font-mono" style={{ borderColor: BRAND.line, background: BRAND.white, resize: 'vertical' }} />
         {project.caption && (
           <button onClick={() => navigator.clipboard.writeText(project.caption)}
@@ -2371,34 +2706,61 @@ function ContentPanel({ project, updateProject, metrics, autoFillDescription, au
 
 /* ExportPanel — mobile-only "Export" tab containing Save / Image / Video buttons
    plus the video loop length picker. On desktop the same actions live in the top bar. */
-function ExportPanel({ project, updateProject, saveProject, exportImage, exportVideo, exportStatus }) {
+function ExportPanel({ project, updateProject, saveProject, exportImage, exportVideo, exportBothImages, exportBothVideos, exportStatus, currentPage }) {
   return (
     <div className="space-y-5">
       <div>
-        <div className="font-display text-xs font-bold uppercase tracking-widest mb-2" style={{ color: BRAND.muted }}>Export</div>
+        <div className="font-display text-xs font-bold uppercase tracking-widest mb-2" style={{ color: BRAND.muted }}>
+          Export Current Page <span style={{ color: BRAND.orange }}>· Page {currentPage}</span>
+        </div>
         <div className="space-y-2">
           <button onClick={exportImage}
             className="font-display w-full flex items-center justify-center gap-2 py-3 text-sm font-semibold uppercase tracking-wider text-white"
             style={{ background: BRAND.ink }}>
-            <Download size={15} /> Export image (PNG)
+            <Download size={15} /> Image (PNG)
           </button>
           <button onClick={exportVideo}
             className="font-display w-full flex items-center justify-center gap-2 py-3 text-sm font-semibold uppercase tracking-wider text-white"
             style={{ background: BRAND.orange }}>
-            <Video size={15} /> Export video ({project.videoLoopLength}s loop)
-          </button>
-          <button onClick={saveProject}
-            className="font-display w-full flex items-center justify-center gap-2 py-3 text-sm font-semibold uppercase tracking-wider"
-            style={{ background: BRAND.white, border: `1px solid ${BRAND.line}` }}>
-            <Save size={15} /> Save project
+            <Video size={15} /> Video ({project.videoLoopLength}s loop)
           </button>
         </div>
-        {exportStatus && (
-          <div className="text-[11px] mt-2 p-2" style={{ background: BRAND.white, color: BRAND.olive, border: `1px solid ${BRAND.line}` }}>
-            {exportStatus}
-          </div>
-        )}
       </div>
+
+      <div>
+        <div className="font-display text-xs font-bold uppercase tracking-widest mb-2" style={{ color: BRAND.muted }}>
+          Export Both Pages
+        </div>
+        <div className="space-y-2">
+          <button onClick={exportBothImages}
+            className="font-display w-full flex items-center justify-center gap-2 py-3 text-sm font-semibold uppercase tracking-wider"
+            style={{ background: BRAND.white, border: `2px solid ${BRAND.ink}`, color: BRAND.ink }}>
+            <Download size={15} /> Both images (×2 PNGs)
+          </button>
+          <button onClick={exportBothVideos}
+            className="font-display w-full flex items-center justify-center gap-2 py-3 text-sm font-semibold uppercase tracking-wider"
+            style={{ background: BRAND.white, border: `2px solid ${BRAND.orange}`, color: BRAND.orange }}>
+            <Video size={15} /> Both videos (×2, sequential)
+          </button>
+        </div>
+        <div className="text-[10px] mt-2 leading-relaxed" style={{ color: BRAND.muted }}>
+          "Both videos" records page 1 then page 2 back-to-back, taking {project.videoLoopLength * 2}s in total. Don't switch pages while it's running.
+        </div>
+      </div>
+
+      <div>
+        <button onClick={saveProject}
+          className="font-display w-full flex items-center justify-center gap-2 py-3 text-sm font-semibold uppercase tracking-wider"
+          style={{ background: BRAND.white, border: `1px solid ${BRAND.line}` }}>
+          <Save size={15} /> Save project
+        </button>
+      </div>
+
+      {exportStatus && (
+        <div className="text-[11px] p-2" style={{ background: BRAND.white, color: BRAND.olive, border: `1px solid ${BRAND.line}` }}>
+          {exportStatus}
+        </div>
+      )}
 
       <div>
         <div className="font-display text-xs font-bold uppercase tracking-widest mb-3" style={{ color: BRAND.muted }}>Video Loop Length</div>
