@@ -3,7 +3,7 @@ import {
   Plus, Trash2, ArrowUp, ArrowDown, Repeat, Image as ImageIcon, Video,
   Download, Save, FolderOpen, Sparkles, MessageSquare, Layers,
   Bookmark, X, Copy, Eye, EyeOff, Move, Palette, FileText,
-  ChevronDown, ChevronUp,
+  ChevronDown, ChevronUp, Tag,
 } from 'lucide-react';
 
 /* =========================================================================
@@ -106,7 +106,11 @@ function rid() {
   return `${t}-${c}-${r}`;
 }
 function seg(label, duration, low, high) {
-  return { id: rid(), type: 'segment', label, duration, intensityLow: low, intensityHigh: high };
+  return {
+    id: rid(), type: 'segment', label, duration,
+    intensityLow: low, intensityHigh: high,
+    labelConfig: { show: 'auto', offsetX: 0, offsetY: 0, color: null, subColor: null, size: 1.0, showIntensity: true, showTime: true },
+  };
 }
 
 const PRESETS = {
@@ -334,11 +338,36 @@ function migrateAnnotation(a) {
   };
 }
 
+// Per-segment label defaults. `show: 'auto'` defers to the global rule
+// (skip if segment too narrow). 'always' forces the label to render with a
+// leader line if needed; 'never' suppresses it.
+const DEFAULT_LABEL_CONFIG = {
+  show: 'auto',          // 'auto' | 'always' | 'never'
+  offsetX: 0,            // horizontal nudge in canvas units (px at 1080 wide)
+  offsetY: 0,            // vertical nudge (negative = up)
+  color: null,           // override intensity colour (null = white)
+  subColor: null,        // override time colour (null = muted white)
+  size: 1.0,             // text size multiplier (0.6 to 2.0)
+  showIntensity: true,
+  showTime: true,
+};
+
+function migrateSegment(s) {
+  if (s.type === 'repeat') {
+    return { ...s, children: (s.children || []).map(migrateSegment) };
+  }
+  return {
+    ...s,
+    labelConfig: { ...DEFAULT_LABEL_CONFIG, ...(s.labelConfig || {}) },
+  };
+}
+
 function migrateProject(p) {
   return {
     detailedPlan: '',
     showGraphLabels: false,
     ...p,
+    segments: (p.segments || []).map(migrateSegment),
     positions: { ...DEFAULT_POSITIONS, ...(p.positions || {}) },
     annotations: (p.annotations || []).map(migrateAnnotation),
   };
@@ -560,8 +589,18 @@ function drawGraph(ctx, rect, flatSegs, sport, style, showLabels = false) {
   const maxIntensity = Math.max(140, ...flatSegs.map(s => s.intensityHigh));
   const minPx = 1;
   const axisPad = Math.round(h * 0.12);
-  // Reserve a bit more headroom inside the graph for above-bar labels
-  const labelPad = showLabels ? Math.round(h * 0.18) : 0;
+  // Reserve headroom for above-bar labels. If any segments are forced to 'always'
+  // show labels but are too narrow for inline placement, leader mode kicks in
+  // and the labels stack higher — give them more room.
+  const baseLabelSize = Math.round(w * 0.018);
+  const minWidthForInline = Math.max(38, baseLabelSize * 3.5);
+  const hasLeaderLabels = showLabels && flatSegs.some(s => {
+    const cfg = s.labelConfig;
+    if (!cfg || cfg.show !== 'always') return false;
+    const segW = (s.duration / Math.max(1, flatSegs.reduce((a, x) => a + x.duration, 0))) * (w - 16);
+    return segW < minWidthForInline;
+  });
+  const labelPad = showLabels ? Math.round(h * (hasLeaderLabels ? 0.32 : 0.18)) : 0;
   const innerY = y + 8 + labelPad;
   const innerH = h - axisPad - 8 - labelPad;
   const innerX = x + 8;
@@ -646,40 +685,108 @@ function drawGraph(ctx, rect, flatSegs, sport, style, showLabels = false) {
   ctx.textAlign = 'right';
   ctx.fillText(fmtDuration(totalMin), innerX + innerW, innerY + innerH + 6);
 
-  // Per-segment labels (time + intensity) above each bar.
-  // Skips segments too narrow to fit a readable label, with optional decimation
-  // when many narrow segments cluster (e.g. inside a repeat block).
+  // Per-segment labels — each segment has its own labelConfig that overrides
+  // the global default. Behaviour:
+  //   - show 'never': skipped entirely
+  //   - show 'auto':  same as before — render only if segment is wide enough
+  //   - show 'always': always render. If segment is too narrow, fall back to
+  //                    a leader line connecting bar to label, and stagger
+  //                    consecutive forced labels onto two rows so they don't collide.
   if (showLabels) {
-    const labelSize = Math.round(w * 0.018);
-    const subSize = Math.round(w * 0.014);
-    const minWidthForLabel = Math.max(38, labelSize * 3.5);
+    const baseLabelSize = Math.round(w * 0.018);
+    const baseSubSize = Math.round(w * 0.014);
+    const minWidthForInline = Math.max(38, baseLabelSize * 3.5);
+    const leaderRowGap = baseLabelSize * 2.6;
 
     ctx.textAlign = 'center';
     ctx.textBaseline = 'bottom';
 
-    // Decimate: when many segments are below threshold and identical, label only the first
-    let lastLabelEndX = -Infinity;
-    labelAnchors.forEach(({ centreX, segW, segment, topY }) => {
-      if (segW < minWidthForLabel) return;
-      // Avoid overlap: skip if too close to the previous label
-      if (centreX - lastLabelEndX < minWidthForLabel * 0.45) return;
+    // First, classify each anchor: inline (above bar), leader (above bar with line), or skipped
+    const placements = labelAnchors.map((anchor) => {
+      const cfg = anchor.segment.labelConfig || DEFAULT_LABEL_CONFIG;
+      if (cfg.show === 'never') return { skip: true, anchor, cfg };
+      if (cfg.show === 'always') {
+        return {
+          mode: anchor.segW < minWidthForInline ? 'leader' : 'inline',
+          anchor, cfg,
+        };
+      }
+      // 'auto' or undefined → inline only if wide enough
+      if (anchor.segW < minWidthForInline) return { skip: true, anchor, cfg };
+      return { mode: 'inline', anchor, cfg };
+    });
+
+    // Anti-overlap pass for inline labels (skip ones too close to a previous inline)
+    let lastInlineEndX = -Infinity;
+    placements.forEach((p) => {
+      if (p.skip || p.mode !== 'inline') return;
+      const cfg = p.cfg;
+      // Auto-mode segments still defer to anti-overlap; 'always' mode wins
+      if (cfg.show === 'auto' && p.anchor.centreX - lastInlineEndX < minWidthForInline * 0.45) {
+        p.skip = true;
+        return;
+      }
+      lastInlineEndX = p.anchor.centreX + p.anchor.segW / 2;
+    });
+
+    // Stagger leader-mode labels onto two rows alternately so consecutive
+    // narrow forced labels don't all sit at the same vertical position
+    let leaderRowIdx = 0;
+    placements.forEach((p) => {
+      if (p.skip || p.mode !== 'leader') return;
+      p.row = leaderRowIdx % 2; // 0 = upper, 1 = lower
+      leaderRowIdx++;
+    });
+
+    // Render
+    placements.forEach((p) => {
+      if (p.skip) return;
+      const cfg = p.cfg;
+      const { centreX, segment, topY } = p.anchor;
+      const sizeMul = Math.max(0.6, Math.min(2.0, cfg.size || 1.0));
+      const labelSize = Math.round(baseLabelSize * sizeMul);
+      const subSize = Math.round(baseSubSize * sizeMul);
 
       const intensityText = segment.intensityLow === segment.intensityHigh
         ? `${segment.intensityLow}%`
         : `${segment.intensityLow}–${segment.intensityHigh}%`;
       const timeText = fmtDuration(segment.duration);
 
-      // Two-line label: intensity (bold, white) above time (smaller, muted)
-      ctx.font = `700 ${labelSize}px "League Spartan", system-ui, sans-serif`;
-      ctx.fillStyle = BRAND.white;
-      const yIntensity = topY - 6;
-      ctx.fillText(intensityText, centreX, yIntensity);
+      const showI = cfg.showIntensity !== false;
+      const showT = cfg.showTime !== false;
+      if (!showI && !showT) return;
 
-      ctx.font = `500 ${subSize}px Roboto, system-ui, sans-serif`;
-      ctx.fillStyle = 'rgba(255,255,255,0.6)';
-      ctx.fillText(timeText, centreX, yIntensity - labelSize - 2);
+      const intensityColor = cfg.color || BRAND.white;
+      const timeColor = cfg.subColor || 'rgba(255,255,255,0.6)';
 
-      lastLabelEndX = centreX + segW / 2;
+      // Compute label x/y including leader offset and user nudges
+      let labelX = centreX + (cfg.offsetX || 0);
+      // For leader mode, push label up further to clear the bar; row 1 sits even higher
+      const leaderLift = p.mode === 'leader' ? leaderRowGap * (1 + (p.row || 0) * 0.9) : 0;
+      let labelY = topY - 6 - leaderLift + (cfg.offsetY || 0);
+
+      // Draw leader line for leader-mode (from bar top to label)
+      if (p.mode === 'leader') {
+        ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(centreX, topY - 2);
+        ctx.lineTo(labelX, labelY + 4);
+        ctx.stroke();
+      }
+
+      // Draw text — intensity on top, time below
+      if (showI) {
+        ctx.font = `700 ${labelSize}px "League Spartan", system-ui, sans-serif`;
+        ctx.fillStyle = intensityColor;
+        ctx.fillText(intensityText, labelX, labelY);
+      }
+      if (showT) {
+        ctx.font = `500 ${subSize}px Roboto, system-ui, sans-serif`;
+        ctx.fillStyle = timeColor;
+        const timeY = showI ? labelY - labelSize - 2 : labelY;
+        ctx.fillText(timeText, labelX, timeY);
+      }
     });
   }
 }
@@ -1206,6 +1313,30 @@ export default function App() {
     setProject(p => ({ ...p, segments: update(p.segments) }));
   };
 
+  // Patch a single field on a segment's labelConfig without overwriting the others.
+  const updateSegmentLabelConfig = (id, configPatch) => {
+    const update = (list) => list.map(s => {
+      if (s.id === id) {
+        const current = s.labelConfig || { ...DEFAULT_LABEL_CONFIG };
+        return { ...s, labelConfig: { ...current, ...configPatch } };
+      }
+      if (s.type === 'repeat') return { ...s, children: update(s.children) };
+      return s;
+    });
+    setProject(p => ({ ...p, segments: update(p.segments) }));
+  };
+
+  // Bulk action — set the `show` mode on every segment in the workout to
+  // 'always' / 'never' / 'auto'. Used by Style tab quick actions.
+  const setAllLabelsShow = (mode) => {
+    const update = (list) => list.map(s => {
+      if (s.type === 'repeat') return { ...s, children: update(s.children) };
+      const current = s.labelConfig || { ...DEFAULT_LABEL_CONFIG };
+      return { ...s, labelConfig: { ...current, show: mode } };
+    });
+    setProject(p => ({ ...p, segments: update(p.segments) }));
+  };
+
   const removeSegment = (id) => {
     const filter = (list) => list.filter(s => s.id !== id).map(s => s.type === 'repeat' ? { ...s, children: filter(s.children) } : s);
     setProject(p => ({ ...p, segments: filter(p.segments) }));
@@ -1704,8 +1835,8 @@ export default function App() {
 
   const renderActivePanel = () => {
     switch (activeTab) {
-      case 'build':      return <BuildPanel project={project} addSegment={addSegment} addRepeat={addRepeat} updateSegment={updateSegment} removeSegment={removeSegment} moveSegment={moveSegment} />;
-      case 'style':      return <StylePanel project={project} updateProject={updateProject} handleLogoUpload={handleLogoUpload} resetLogo={resetLogo} />;
+      case 'build':      return <BuildPanel project={project} addSegment={addSegment} addRepeat={addRepeat} updateSegment={updateSegment} updateSegmentLabelConfig={updateSegmentLabelConfig} removeSegment={removeSegment} moveSegment={moveSegment} />;
+      case 'style':      return <StylePanel project={project} updateProject={updateProject} handleLogoUpload={handleLogoUpload} resetLogo={resetLogo} setAllLabelsShow={setAllLabelsShow} />;
       case 'background': return <BackgroundPanel project={project} updateProject={updateProject} bgFile={bgFile} setBgFile={setBgFile} handleBackgroundUpload={handleBackgroundUpload} />;
       case 'annotate':   return <AnnotatePanel project={project} flat={flat} addAnnotation={addAnnotation} updateAnnotation={updateAnnotation} removeAnnotation={removeAnnotation} resetAnnotationStyle={resetAnnotationStyle} />;
       case 'layout':     return <LayoutPanel project={project} updateProject={updateProject} />;
@@ -1952,14 +2083,16 @@ function Metric({ label, value }) {
   );
 }
 
-function BuildPanel({ project, addSegment, addRepeat, updateSegment, removeSegment, moveSegment }) {
+function BuildPanel({ project, addSegment, addRepeat, updateSegment, updateSegmentLabelConfig, removeSegment, moveSegment }) {
   return (
     <div>
       <div className="font-display text-xs font-bold uppercase tracking-widest mb-3" style={{ color: BRAND.muted }}>Workout Structure</div>
       <div className="space-y-2">
         {project.segments.map(s => (
           <SegmentEditor key={s.id} segment={s} sport={project.sport}
-            updateSegment={updateSegment} removeSegment={removeSegment} moveSegment={moveSegment} />
+            labelsEnabled={!!project.showGraphLabels}
+            updateSegment={updateSegment} updateSegmentLabelConfig={updateSegmentLabelConfig}
+            removeSegment={removeSegment} moveSegment={moveSegment} />
         ))}
       </div>
 
@@ -1993,7 +2126,9 @@ function BuildPanel({ project, addSegment, addRepeat, updateSegment, removeSegme
   );
 }
 
-function SegmentEditor({ segment, sport, updateSegment, removeSegment, moveSegment, isChild }) {
+function SegmentEditor({ segment, sport, labelsEnabled, updateSegment, updateSegmentLabelConfig, removeSegment, moveSegment, isChild }) {
+  const [labelOpen, setLabelOpen] = useState(false);
+
   if (segment.type === 'repeat') {
     return (
       <div className="border-2 border-dashed p-2" style={{ borderColor: BRAND.olive, background: 'rgba(106,113,75,0.04)' }}>
@@ -2015,7 +2150,9 @@ function SegmentEditor({ segment, sport, updateSegment, removeSegment, moveSegme
         <div className="space-y-1.5 ml-3">
           {segment.children.map(c => (
             <SegmentEditor key={c.id} segment={c} sport={sport} isChild={true}
-              updateSegment={updateSegment} removeSegment={removeSegment} moveSegment={moveSegment} />
+              labelsEnabled={labelsEnabled}
+              updateSegment={updateSegment} updateSegmentLabelConfig={updateSegmentLabelConfig}
+              removeSegment={removeSegment} moveSegment={moveSegment} />
           ))}
           <button
             onClick={() => updateSegment(segment.id, { children: [...segment.children, seg('Step', 1, 60, 70)] })}
@@ -2030,34 +2167,137 @@ function SegmentEditor({ segment, sport, updateSegment, removeSegment, moveSegme
 
   const mid = (segment.intensityLow + segment.intensityHigh) / 2;
   const zone = getZoneFor(mid, sport);
+  const cfg = segment.labelConfig || DEFAULT_LABEL_CONFIG;
+
+  // Compact label-state badge: A (auto), S (always show), H (hidden)
+  const labelBadge = cfg.show === 'always' ? 'S' : cfg.show === 'never' ? 'H' : 'A';
+  const labelBadgeColor = cfg.show === 'always' ? BRAND.orange : cfg.show === 'never' ? '#a13d00' : BRAND.muted;
 
   return (
-    <div className="bg-white border p-2" style={{ borderColor: BRAND.line }}>
-      <div className="flex items-center gap-1 mb-1.5">
-        <div style={{ width: 6, height: 22, background: zone.color }} />
-        <DebouncedInput value={segment.label}
-          onCommit={v => updateSegment(segment.id, { label: v })}
-          className="flex-1 font-display text-xs font-semibold uppercase tracking-wide bg-transparent" />
-        {!isChild && (
-          <>
-            <button onClick={() => moveSegment(segment.id, -1)} className="p-1 hover:bg-gray-50"><ArrowUp size={10} /></button>
-            <button onClick={() => moveSegment(segment.id, 1)} className="p-1 hover:bg-gray-50"><ArrowDown size={10} /></button>
-          </>
-        )}
-        <button onClick={() => removeSegment(segment.id)} className="p-1 hover:bg-gray-50" style={{ color: '#a13d00' }}><X size={11} /></button>
+    <div className="bg-white border" style={{ borderColor: BRAND.line }}>
+      <div className="p-2">
+        <div className="flex items-center gap-1 mb-1.5">
+          <div style={{ width: 6, height: 22, background: zone.color }} />
+          <DebouncedInput value={segment.label}
+            onCommit={v => updateSegment(segment.id, { label: v })}
+            className="flex-1 font-display text-xs font-semibold uppercase tracking-wide bg-transparent" />
+          <button
+            onClick={() => setLabelOpen(o => !o)}
+            className="p-1 hover:bg-gray-50 flex items-center gap-0.5 font-display text-[9px] font-bold uppercase tracking-wider"
+            style={{ color: labelOpen ? BRAND.orange : labelBadgeColor }}
+            title={labelsEnabled ? `Segment label: ${cfg.show}` : 'Enable Show segment labels in Style tab to use'}>
+            <Tag size={10} /><span style={{ minWidth: 8, display: 'inline-block', textAlign: 'center' }}>{labelBadge}</span>
+          </button>
+          {!isChild && (
+            <>
+              <button onClick={() => moveSegment(segment.id, -1)} className="p-1 hover:bg-gray-50"><ArrowUp size={10} /></button>
+              <button onClick={() => moveSegment(segment.id, 1)} className="p-1 hover:bg-gray-50"><ArrowDown size={10} /></button>
+            </>
+          )}
+          <button onClick={() => removeSegment(segment.id)} className="p-1 hover:bg-gray-50" style={{ color: '#a13d00' }}><X size={11} /></button>
+        </div>
+        <div className="grid grid-cols-3 gap-1.5">
+          <NumberField label="Min" value={segment.duration} step={0.5}
+            onChange={v => updateSegment(segment.id, { duration: v })} />
+          <NumberField label="Low %" value={segment.intensityLow}
+            onChange={v => updateSegment(segment.id, { intensityLow: v })} integer />
+          <NumberField label="High %" value={segment.intensityHigh}
+            onChange={v => updateSegment(segment.id, { intensityHigh: v })} integer />
+        </div>
+        <div className="mt-1 text-[10px] flex justify-between" style={{ color: BRAND.muted }}>
+          <span className="font-display">{zone.name}</span>
+          <span>{segment.intensityLow}–{segment.intensityHigh}% · {fmtDuration(segment.duration)}</span>
+        </div>
       </div>
-      <div className="grid grid-cols-3 gap-1.5">
-        <NumberField label="Min" value={segment.duration} step={0.5}
-          onChange={v => updateSegment(segment.id, { duration: v })} />
-        <NumberField label="Low %" value={segment.intensityLow}
-          onChange={v => updateSegment(segment.id, { intensityLow: v })} integer />
-        <NumberField label="High %" value={segment.intensityHigh}
-          onChange={v => updateSegment(segment.id, { intensityHigh: v })} integer />
-      </div>
-      <div className="mt-1 text-[10px] flex justify-between" style={{ color: BRAND.muted }}>
-        <span className="font-display">{zone.name}</span>
-        <span>{segment.intensityLow}–{segment.intensityHigh}% · {fmtDuration(segment.duration)}</span>
-      </div>
+
+      {labelOpen && (
+        <div className="border-t p-2 space-y-2.5" style={{ borderColor: BRAND.line, background: BRAND.panel }}>
+          <div className="font-display text-[10px] font-bold uppercase tracking-widest" style={{ color: BRAND.muted }}>
+            Segment Label {!labelsEnabled && <span style={{ color: '#a13d00', fontWeight: 'normal', textTransform: 'none' }}>· Enable in Style tab first</span>}
+          </div>
+
+          <div className="grid grid-cols-3 gap-1">
+            {[
+              { v: 'auto',   l: 'Auto',  hint: 'Show if wide enough' },
+              { v: 'always', l: 'Show',  hint: 'Force show with leader if narrow' },
+              { v: 'never',  l: 'Hide',  hint: 'Never show' },
+            ].map(opt => (
+              <button key={opt.v} onClick={() => updateSegmentLabelConfig(segment.id, { show: opt.v })}
+                className="font-display py-1.5 text-[10px] font-semibold uppercase tracking-wider"
+                style={{
+                  background: cfg.show === opt.v ? BRAND.ink : BRAND.white,
+                  color: cfg.show === opt.v ? BRAND.white : BRAND.ink,
+                  border: `1px solid ${BRAND.line}`,
+                }}
+                title={opt.hint}>
+                {opt.l}
+              </button>
+            ))}
+          </div>
+
+          {cfg.show !== 'never' && (
+            <>
+              <div className="flex items-center gap-3">
+                <label className="flex items-center gap-1 text-[10px]">
+                  <input type="checkbox" checked={cfg.showIntensity !== false}
+                    onChange={e => updateSegmentLabelConfig(segment.id, { showIntensity: e.target.checked })} />
+                  <span className="font-display uppercase tracking-wider" style={{ color: BRAND.muted }}>%</span>
+                </label>
+                <label className="flex items-center gap-1 text-[10px]">
+                  <input type="checkbox" checked={cfg.showTime !== false}
+                    onChange={e => updateSegmentLabelConfig(segment.id, { showTime: e.target.checked })} />
+                  <span className="font-display uppercase tracking-wider" style={{ color: BRAND.muted }}>Time</span>
+                </label>
+              </div>
+
+              <SliderInput label="Size" min={0.6} max={2.0} step={0.1}
+                value={cfg.size || 1.0}
+                format={v => `${v.toFixed(1)}×`}
+                onChange={v => updateSegmentLabelConfig(segment.id, { size: v })} />
+
+              <div className="grid grid-cols-2 gap-2">
+                <NumberField label="Nudge X" value={cfg.offsetX || 0}
+                  onChange={v => updateSegmentLabelConfig(segment.id, { offsetX: v })} integer />
+                <NumberField label="Nudge Y" value={cfg.offsetY || 0}
+                  onChange={v => updateSegmentLabelConfig(segment.id, { offsetY: v })} integer />
+              </div>
+
+              <div className="space-y-1.5">
+                <div className="flex items-center gap-2">
+                  <span className="font-display text-[10px] uppercase tracking-wider flex-1" style={{ color: BRAND.muted }}>Intensity colour</span>
+                  <input type="color" value={cfg.color || '#ffffff'}
+                    onChange={e => updateSegmentLabelConfig(segment.id, { color: e.target.value })}
+                    className="w-6 h-6 cursor-pointer" style={{ border: `1px solid ${BRAND.line}` }} />
+                  {cfg.color && (
+                    <button onClick={() => updateSegmentLabelConfig(segment.id, { color: null })}
+                      className="font-display text-[9px] uppercase tracking-wider px-1.5 py-0.5"
+                      style={{ background: BRAND.white, border: `1px solid ${BRAND.line}` }}
+                      title="Reset to default">×</button>
+                  )}
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="font-display text-[10px] uppercase tracking-wider flex-1" style={{ color: BRAND.muted }}>Time colour</span>
+                  <input type="color" value={cfg.subColor || '#999999'}
+                    onChange={e => updateSegmentLabelConfig(segment.id, { subColor: e.target.value })}
+                    className="w-6 h-6 cursor-pointer" style={{ border: `1px solid ${BRAND.line}` }} />
+                  {cfg.subColor && (
+                    <button onClick={() => updateSegmentLabelConfig(segment.id, { subColor: null })}
+                      className="font-display text-[9px] uppercase tracking-wider px-1.5 py-0.5"
+                      style={{ background: BRAND.white, border: `1px solid ${BRAND.line}` }}
+                      title="Reset to default">×</button>
+                  )}
+                </div>
+              </div>
+            </>
+          )}
+
+          <button onClick={() => updateSegmentLabelConfig(segment.id, { ...DEFAULT_LABEL_CONFIG })}
+            className="font-display w-full py-1 text-[9px] font-semibold uppercase tracking-wider"
+            style={{ background: BRAND.white, border: `1px solid ${BRAND.line}`, color: BRAND.muted }}>
+            Reset label to defaults
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -2114,7 +2354,7 @@ function NumberField({ label, value, onChange, step = 1, integer = false }) {
   );
 }
 
-function StylePanel({ project, updateProject, handleLogoUpload, resetLogo }) {
+function StylePanel({ project, updateProject, handleLogoUpload, resetLogo, setAllLabelsShow }) {
   return (
     <div className="space-y-5">
       <div>
@@ -2144,9 +2384,37 @@ function StylePanel({ project, updateProject, handleLogoUpload, resetLogo }) {
             Show time + intensity above each bar
           </label>
         </div>
-        <div className="text-[10px] mt-1.5" style={{ color: BRAND.muted }}>
-          Useful on Page 2. Narrow segments are skipped automatically to avoid overlap.
-        </div>
+
+        {project.showGraphLabels && (
+          <>
+            <div className="font-display text-[10px] font-bold uppercase tracking-wider mt-3 mb-1.5" style={{ color: BRAND.muted }}>
+              Bulk action — set every segment to:
+            </div>
+            <div className="grid grid-cols-3 gap-1">
+              {[
+                { v: 'auto',   l: 'Auto'  },
+                { v: 'always', l: 'Show All'  },
+                { v: 'never',  l: 'Hide All' },
+              ].map(opt => (
+                <button key={opt.v} onClick={() => setAllLabelsShow(opt.v)}
+                  className="font-display py-1.5 text-[10px] font-semibold uppercase tracking-wider"
+                  style={{ background: BRAND.white, border: `1px solid ${BRAND.line}` }}>
+                  {opt.l}
+                </button>
+              ))}
+            </div>
+            <div className="text-[10px] mt-1.5 leading-relaxed" style={{ color: BRAND.muted }}>
+              Per-segment overrides are set in the <strong>Build</strong> tab — tap the <Tag size={10} className="inline" /> badge on any segment.
+              Forced labels on narrow segments use a leader line.
+            </div>
+          </>
+        )}
+
+        {!project.showGraphLabels && (
+          <div className="text-[10px] mt-1.5" style={{ color: BRAND.muted }}>
+            Enable to access per-segment label customisation in the Build tab.
+          </div>
+        )}
       </div>
 
       <div>
