@@ -540,9 +540,9 @@ function drawCanvas(ctx, opts) {
 
 function drawPageIndicator(ctx, currentPage, W, H, pad, metricsOffset = 0) {
   const cx = W / 2;
-  // Sit above the metrics block (which has height roughly W * 0.12 from the bottom)
-  const totalBlockH = Math.round(W * 0.07) + Math.round(W * 0.025) + Math.round(W * 0.026);
-  const y = H - pad - totalBlockH - Math.round(W * 0.025) + metricsOffset;
+  // Sit above the metrics row (pill height only — wordmark is on the same line, not stacked)
+  const pillH = Math.round(W * 0.07);
+  const y = H - pad - pillH - Math.round(W * 0.025) + metricsOffset;
   const r = Math.round(W * 0.008);
   const gap = r * 3;
   for (let p = 1; p <= 2; p++) {
@@ -1382,11 +1382,9 @@ function drawCalculations(ctx, project, flatSegs, sport, pad, H, W, yOffset = 0)
   const pillH = Math.round(W * 0.07);
   const pillSize = Math.round(W * 0.022);
   const labelSize = Math.round(W * 0.016);
-  // Wordmark sits BELOW the metrics row; reserve space for it
-  const wordmarkSize = Math.round(W * 0.026);
-  const wordmarkGap = Math.round(W * 0.025);
-  const totalBlockH = pillH + wordmarkGap + wordmarkSize;
-  const y = H - pad - totalBlockH + yOffset;
+  // Wordmark sits to the RIGHT of the metrics on the same row, vertically centred to the pill height.
+  const wordmarkSize = Math.round(W * 0.028);
+  const y = H - pad - pillH + yOffset;
 
   const fmtIF = (v) => v.toFixed(2);
   const fmtTSS = (v) => `${Math.round(v)}`;
@@ -1403,7 +1401,7 @@ function drawCalculations(ctx, project, flatSegs, sport, pad, H, W, yOffset = 0)
     { label: sport === 'cycling' ? 'TSS' : 'rTSS', value: tssRange },
   ];
 
-  // First pass: measure each pill's width
+  // Measure each pill's width
   const pillWidths = items.map(item => {
     ctx.font = `700 ${pillSize}px "League Spartan", system-ui, sans-serif`;
     const valW = ctx.measureText(item.value).width;
@@ -1412,10 +1410,9 @@ function drawCalculations(ctx, project, flatSegs, sport, pad, H, W, yOffset = 0)
     return Math.max(valW, labW) + 36;
   });
   const gap = 12;
-  const totalW = pillWidths.reduce((sum, w) => sum + w, 0) + gap * (items.length - 1);
-  // Centre the row horizontally
-  let cx = Math.round((W - totalW) / 2);
 
+  // Pills are anchored at the LEFT edge (after pad)
+  let cx = pad;
   items.forEach((item, idx) => {
     const pillW = pillWidths[idx];
     ctx.fillStyle = 'rgba(255,255,255,0.1)';
@@ -1439,12 +1436,12 @@ function drawCalculations(ctx, project, flatSegs, sport, pad, H, W, yOffset = 0)
     cx += pillW + gap;
   });
 
-  // Wordmark — centred under the metrics row, larger and brighter than before
+  // Wordmark — anchored at RIGHT edge, vertically centred to the pill row
   ctx.font = `700 ${wordmarkSize}px "League Spartan", system-ui, sans-serif`;
   ctx.fillStyle = 'rgba(255,255,255,0.78)';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'top';
-  ctx.fillText('paceon.com.au', W / 2, y + pillH + wordmarkGap);
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('paceon.com.au', W - pad, y + pillH / 2);
 }
 
 function roundRect(ctx, x, y, w, h, r) {
