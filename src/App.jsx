@@ -244,11 +244,28 @@ function calculateMetrics(flatSegs, sport) {
   return { totalMin, ifLow, ifHigh, tssLow: hours * Math.pow(ifLow, 2) * 100, tssHigh: hours * Math.pow(ifHigh, 2) * 100 };
 }
 
+/* Format a duration (stored as decimal minutes) for display.
+   - < 1min → "30s", "45s"
+   - whole minutes < 60 → "5min", "20min"
+   - mixed minutes/seconds → "1m 30s", "4m 30s"
+   - >= 60min → "1h", "1h 30min"
+   Designed to read naturally for both whole-minute steady-state work and
+   sub-minute intervals (e.g. 15s, 30s spikes). */
 function fmtDuration(min) {
-  if (min < 60) return `${Math.round(min * 10) / 10}min`;
-  const h = Math.floor(min / 60);
-  const m = Math.round(min - h * 60);
-  return m === 0 ? `${h}h` : `${h}h ${m}min`;
+  if (!min || min <= 0) return '0s';
+  // Round to nearest second for stable display
+  const totalSec = Math.round(min * 60);
+  if (totalSec < 60) return `${totalSec}s`;
+  if (totalSec < 3600) {
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec - m * 60;
+    if (s === 0) return `${m}min`;
+    return `${m}m ${s}s`;
+  }
+  const h = Math.floor(totalSec / 3600);
+  const remM = Math.round((totalSec - h * 3600) / 60);
+  if (remM === 0) return `${h}h`;
+  return `${h}h ${remM}min`;
 }
 
 // Force any focused text input/textarea to blur, which fires its onBlur handler
@@ -685,13 +702,18 @@ function drawGraph(ctx, rect, flatSegs, sport, style, showLabels = false) {
   ctx.textAlign = 'right';
   ctx.fillText(fmtDuration(totalMin), innerX + innerW, innerY + innerH + 6);
 
-  // Per-segment labels — each segment has its own labelConfig that overrides
-  // the global default. Behaviour:
-  //   - show 'never': skipped entirely
-  //   - show 'auto':  same as before — render only if segment is wide enough
-  //   - show 'always': always render. If segment is too narrow, fall back to
-  //                    a leader line connecting bar to label, and stagger
-  //                    consecutive forced labels onto two rows so they don't collide.
+  // Per-segment / per-repeat-block labels.
+  //
+  // Each "label unit" represents either:
+  //   (a) a single non-repeat segment, labelled in the current per-segment style
+  //   (b) an entire repeat block (all iterations × all children), labelled
+  //       once at the centre of the block with a summary like "3 × 30s @ 120%"
+  //
+  // The labelConfig that controls a repeat-block label is the FIRST child segment's
+  // labelConfig — show/hide, colour, size etc all come from there. This keeps the
+  // UI simple: if you want to hide labels for a repeat block, set the first child
+  // to Hide; if you want to force-show with a custom colour, set it on the first
+  // child. Future enhancement could move labelConfig onto the repeat itself.
   if (showLabels) {
     const baseLabelSize = Math.round(w * 0.018);
     const baseSubSize = Math.round(w * 0.014);
@@ -701,56 +723,151 @@ function drawGraph(ctx, rect, flatSegs, sport, style, showLabels = false) {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'bottom';
 
-    // First, classify each anchor: inline (above bar), leader (above bar with line), or skipped
-    const placements = labelAnchors.map((anchor) => {
-      const cfg = anchor.segment.labelConfig || DEFAULT_LABEL_CONFIG;
-      if (cfg.show === 'never') return { skip: true, anchor, cfg };
+    // Build label units by walking the labelAnchors array and grouping consecutive
+    // anchors that share the same _repeatId.
+    const labelUnits = [];
+    let i = 0;
+    while (i < labelAnchors.length) {
+      const a = labelAnchors[i];
+      const repeatId = a.segment._repeatId;
+      if (!repeatId) {
+        // Standalone segment — one unit
+        labelUnits.push({
+          kind: 'segment',
+          anchor: a,
+          // The unit's centre and width are just the bar's own
+          centreX: a.centreX,
+          unitW: a.segW,
+          topY: a.topY,
+          cfg: a.segment.labelConfig || DEFAULT_LABEL_CONFIG,
+        });
+        i++;
+      } else {
+        // Repeat block — gather all consecutive anchors with the same _repeatId
+        const groupAnchors = [];
+        const startI = i;
+        while (i < labelAnchors.length && labelAnchors[i].segment._repeatId === repeatId) {
+          groupAnchors.push(labelAnchors[i]);
+          i++;
+        }
+        // Compute the unit's bounding centre + total span
+        const firstAnchor = groupAnchors[0];
+        const lastAnchor = groupAnchors[groupAnchors.length - 1];
+        const leftEdge = firstAnchor.centreX - firstAnchor.segW / 2;
+        const rightEdge = lastAnchor.centreX + lastAnchor.segW / 2;
+        const unitCentreX = (leftEdge + rightEdge) / 2;
+        const unitW = rightEdge - leftEdge;
+
+        // Use the highest top (smallest y) across all bars in the group so the
+        // label sits above the tallest bar in the block.
+        const topY = Math.min(...groupAnchors.map(a => a.topY));
+
+        // Labelling config from the first child's labelConfig.
+        // (If the user hides the first child, the whole repeat label is hidden too.)
+        const cfg = firstAnchor.segment.labelConfig || DEFAULT_LABEL_CONFIG;
+
+        // Determine count and child structure from the group itself
+        // groupAnchors length = count × children-per-iteration.
+        // Find children count by counting until the first child appears again.
+        let childrenPerIter = 1;
+        for (let k = 1; k < groupAnchors.length; k++) {
+          if (groupAnchors[k].segment._repeatIdx !== groupAnchors[0].segment._repeatIdx) {
+            childrenPerIter = k;
+            break;
+          }
+        }
+        const count = Math.round(groupAnchors.length / childrenPerIter);
+        const childSegs = groupAnchors.slice(0, childrenPerIter).map(a => a.segment);
+
+        labelUnits.push({
+          kind: 'repeat',
+          centreX: unitCentreX,
+          unitW,
+          topY,
+          cfg,
+          count,
+          childSegs,
+        });
+      }
+    }
+
+    // Classify placement (inline vs leader vs skip) for each unit
+    const placements = labelUnits.map((u) => {
+      const cfg = u.cfg;
+      if (cfg.show === 'never') return { skip: true, unit: u, cfg };
       if (cfg.show === 'always') {
         return {
-          mode: anchor.segW < minWidthForInline ? 'leader' : 'inline',
-          anchor, cfg,
+          mode: u.unitW < minWidthForInline ? 'leader' : 'inline',
+          unit: u, cfg,
         };
       }
-      // 'auto' or undefined → inline only if wide enough
-      if (anchor.segW < minWidthForInline) return { skip: true, anchor, cfg };
-      return { mode: 'inline', anchor, cfg };
+      // 'auto' — inline only if wide enough
+      if (u.unitW < minWidthForInline) return { skip: true, unit: u, cfg };
+      return { mode: 'inline', unit: u, cfg };
     });
 
-    // Anti-overlap pass for inline labels (skip ones too close to a previous inline)
+    // Anti-overlap pass for inline labels (skip auto-mode if too close to previous)
     let lastInlineEndX = -Infinity;
     placements.forEach((p) => {
       if (p.skip || p.mode !== 'inline') return;
       const cfg = p.cfg;
-      // Auto-mode segments still defer to anti-overlap; 'always' mode wins
-      if (cfg.show === 'auto' && p.anchor.centreX - lastInlineEndX < minWidthForInline * 0.45) {
+      if (cfg.show === 'auto' && p.unit.centreX - lastInlineEndX < minWidthForInline * 0.45) {
         p.skip = true;
         return;
       }
-      lastInlineEndX = p.anchor.centreX + p.anchor.segW / 2;
+      lastInlineEndX = p.unit.centreX + p.unit.unitW / 2;
     });
 
-    // Stagger leader-mode labels onto two rows alternately so consecutive
-    // narrow forced labels don't all sit at the same vertical position
+    // Stagger leader-mode labels onto two rows
     let leaderRowIdx = 0;
     placements.forEach((p) => {
       if (p.skip || p.mode !== 'leader') return;
-      p.row = leaderRowIdx % 2; // 0 = upper, 1 = lower
+      p.row = leaderRowIdx % 2;
       leaderRowIdx++;
     });
 
-    // Render
+    // Helpers to build the text for each unit kind
+    const unitText = (u) => {
+      if (u.kind === 'segment') {
+        const s = u.anchor.segment;
+        const intensity = s.intensityLow === s.intensityHigh
+          ? `${s.intensityLow}%`
+          : `${s.intensityLow}–${s.intensityHigh}%`;
+        return { primary: intensity, secondary: fmtDuration(s.duration) };
+      }
+      // Repeat unit
+      if (u.childSegs.length === 1) {
+        const c = u.childSegs[0];
+        const intensity = c.intensityLow === c.intensityHigh
+          ? `${c.intensityLow}%`
+          : `${c.intensityLow}–${c.intensityHigh}%`;
+        return {
+          primary: `${u.count} × ${fmtDuration(c.duration)}`,
+          secondary: `@ ${intensity}`,
+        };
+      }
+      // Multi-child repeat — summarise as count × first-child desc, with extras
+      // collapsed into a brief tail. If too many children, just show count.
+      const briefs = u.childSegs.map(c => {
+        const intensity = c.intensityLow === c.intensityHigh
+          ? `${c.intensityLow}%`
+          : `${c.intensityLow}–${c.intensityHigh}%`;
+        return `${fmtDuration(c.duration)} @ ${intensity}`;
+      });
+      return {
+        primary: `${u.count} × Round`,
+        secondary: briefs.length <= 2 ? briefs.join(' / ') : `${briefs[0]} + ${briefs.length - 1} more`,
+      };
+    };
+
+    // Render each placement
     placements.forEach((p) => {
       if (p.skip) return;
       const cfg = p.cfg;
-      const { centreX, segment, topY } = p.anchor;
+      const { centreX, topY } = p.unit;
       const sizeMul = Math.max(0.6, Math.min(2.0, cfg.size || 1.0));
       const labelSize = Math.round(baseLabelSize * sizeMul);
       const subSize = Math.round(baseSubSize * sizeMul);
-
-      const intensityText = segment.intensityLow === segment.intensityHigh
-        ? `${segment.intensityLow}%`
-        : `${segment.intensityLow}–${segment.intensityHigh}%`;
-      const timeText = fmtDuration(segment.duration);
 
       const showI = cfg.showIntensity !== false;
       const showT = cfg.showTime !== false;
@@ -759,13 +876,26 @@ function drawGraph(ctx, rect, flatSegs, sport, style, showLabels = false) {
       const intensityColor = cfg.color || BRAND.white;
       const timeColor = cfg.subColor || 'rgba(255,255,255,0.6)';
 
-      // Compute label x/y including leader offset and user nudges
+      const { primary, secondary } = unitText(p.unit);
+
+      // For repeat units, "primary" = count × duration, "secondary" = intensity.
+      // For segment units, "primary" = intensity, "secondary" = time.
+      // The showIntensity / showTime checkboxes apply to the corresponding line:
+      //   - segment: showI=primary, showT=secondary
+      //   - repeat:  showI=secondary (intensity is the second line), showT=primary
+      let topLine, bottomLine, topShown, bottomShown, topColor, bottomColor;
+      if (p.unit.kind === 'segment') {
+        topLine    = secondary; topShown    = showT; topColor    = timeColor;       // time on top
+        bottomLine = primary;   bottomShown = showI; bottomColor = intensityColor;  // intensity below
+      } else {
+        topLine    = primary;   topShown    = showT; topColor    = timeColor;       // count × dur on top (time-ish)
+        bottomLine = secondary; bottomShown = showI; bottomColor = intensityColor;  // @ intensity below
+      }
+
       let labelX = centreX + (cfg.offsetX || 0);
-      // For leader mode, push label up further to clear the bar; row 1 sits even higher
       const leaderLift = p.mode === 'leader' ? leaderRowGap * (1 + (p.row || 0) * 0.9) : 0;
       let labelY = topY - 6 - leaderLift + (cfg.offsetY || 0);
 
-      // Draw leader line for leader-mode (from bar top to label)
       if (p.mode === 'leader') {
         ctx.strokeStyle = 'rgba(255,255,255,0.5)';
         ctx.lineWidth = 1;
@@ -775,17 +905,17 @@ function drawGraph(ctx, rect, flatSegs, sport, style, showLabels = false) {
         ctx.stroke();
       }
 
-      // Draw text — intensity on top, time below
-      if (showI) {
+      // Bottom line first (it sits at labelY)
+      if (bottomShown) {
         ctx.font = `700 ${labelSize}px "League Spartan", system-ui, sans-serif`;
-        ctx.fillStyle = intensityColor;
-        ctx.fillText(intensityText, labelX, labelY);
+        ctx.fillStyle = bottomColor;
+        ctx.fillText(bottomLine, labelX, labelY);
       }
-      if (showT) {
+      if (topShown) {
         ctx.font = `500 ${subSize}px Roboto, system-ui, sans-serif`;
-        ctx.fillStyle = timeColor;
-        const timeY = showI ? labelY - labelSize - 2 : labelY;
-        ctx.fillText(timeText, labelX, timeY);
+        ctx.fillStyle = topColor;
+        const topY2 = bottomShown ? labelY - labelSize - 2 : labelY;
+        ctx.fillText(topLine, labelX, topY2);
       }
     });
   }
@@ -1050,9 +1180,9 @@ const DEFAULT_PROJECT = {
   format: 'story',
   layout: 'graphLed',
   graphStyle: 'stepped',
-  title: 'Zone 2 with Spikes',
-  segments: PRESETS.cycling[2].segments,
-  description: PRESETS.cycling[2].description,
+  title: '',
+  segments: [],
+  description: '',
   detailedPlan: '',
   caption: '',
   annotations: [],
@@ -1372,6 +1502,26 @@ export default function App() {
       description: preset.description,
       annotations: [],
     }));
+  };
+
+  // Wipe everything back to a blank canvas, with confirmation since this is
+  // destructive. Preserves user-level preferences (sport, format, layout,
+  // background) since those are usually carried across sessions; resets only
+  // the workout content (title, segments, descriptions, captions, annotations).
+  const clearProject = () => {
+    if (!confirm('Clear the current workout? This wipes the title, segments, descriptions, caption, and annotations.')) return;
+    flushPendingEdits();
+    setProject(p => ({
+      ...p,
+      title: '',
+      segments: [],
+      description: '',
+      detailedPlan: '',
+      caption: '',
+      annotations: [],
+    }));
+    setExportStatus('Cleared — start fresh');
+    setTimeout(() => setExportStatus(''), 2500);
   };
 
   const addAnnotation = (styleKey = 'science') => {
@@ -1840,7 +1990,7 @@ export default function App() {
       case 'background': return <BackgroundPanel project={project} updateProject={updateProject} bgFile={bgFile} setBgFile={setBgFile} handleBackgroundUpload={handleBackgroundUpload} />;
       case 'annotate':   return <AnnotatePanel project={project} flat={flat} addAnnotation={addAnnotation} updateAnnotation={updateAnnotation} removeAnnotation={removeAnnotation} resetAnnotationStyle={resetAnnotationStyle} />;
       case 'layout':     return <LayoutPanel project={project} updateProject={updateProject} />;
-      case 'presets':    return <PresetsPanel project={project} loadPreset={loadPreset} savedProjects={savedProjects} loadProject={loadProject} deleteProject={deleteProject} exportProjects={exportProjects} importProjects={importProjects} />;
+      case 'presets':    return <PresetsPanel project={project} loadPreset={loadPreset} clearProject={clearProject} savedProjects={savedProjects} loadProject={loadProject} deleteProject={deleteProject} exportProjects={exportProjects} importProjects={importProjects} />;
       case 'content':    return <ContentPanel project={project} updateProject={updateProject} metrics={metrics} autoFillDescription={autoFillDescription} autoFillCaption={autoFillCaption} autoFillDetailedPlan={autoFillDetailedPlan} />;
       case 'export':     return <ExportPanel project={project} updateProject={updateProject} saveProject={saveProject} exportImage={exportImage} exportVideo={exportVideo} exportBothImages={exportBothImages} exportBothVideos={exportBothVideos} exportStatus={exportStatus} currentPage={currentPage} />;
       default:           return null;
@@ -2196,8 +2346,10 @@ function SegmentEditor({ segment, sport, labelsEnabled, updateSegment, updateSeg
           )}
           <button onClick={() => removeSegment(segment.id)} className="p-1 hover:bg-gray-50" style={{ color: '#a13d00' }}><X size={11} /></button>
         </div>
-        <div className="grid grid-cols-3 gap-1.5">
-          <NumberField label="Min" value={segment.duration} step={0.5}
+        <div className="grid grid-cols-4 gap-1.5">
+          <DurationField label="Min" value={segment.duration} mode="min"
+            onChange={v => updateSegment(segment.id, { duration: v })} />
+          <DurationField label="Sec" value={segment.duration} mode="sec"
             onChange={v => updateSegment(segment.id, { duration: v })} />
           <NumberField label="Low %" value={segment.intensityLow}
             onChange={v => updateSegment(segment.id, { intensityLow: v })} integer />
@@ -2347,6 +2499,72 @@ function NumberField({ label, value, onChange, step = 1, integer = false }) {
             lastExternal.current = 0;
             setLocal('0');
             onChange(0);
+          }
+        }}
+        className="w-full px-1.5 py-1 text-xs border" style={{ borderColor: BRAND.line }} />
+    </div>
+  );
+}
+
+/* DurationField — splits a decimal-minute value into separate Min and Sec
+   inputs. Each field is rendered independently (mode="min" or mode="sec") so
+   the SegmentEditor can place them side-by-side in its grid. The two fields
+   share the same underlying `value` (decimal minutes) and `onChange` handler;
+   editing either one recomputes the combined value.
+   - Mode "min": shows whole minutes (Math.floor). Sub-minute values display
+     as 0; the user can still see their seconds in the Sec field.
+   - Mode "sec": shows the seconds remainder (0-59). Editing it past 59
+     overflows into minutes (e.g. typing 90 becomes 1m 30s). */
+function DurationField({ label, value, mode, onChange }) {
+  const totalSec = Math.max(0, Math.round((value || 0) * 60));
+  const mins = Math.floor(totalSec / 60);
+  const secs = totalSec - mins * 60;
+
+  const displayValue = mode === 'min' ? mins : secs;
+  const [local, setLocal] = useState(String(displayValue));
+  const lastDisplayed = useRef(displayValue);
+
+  useEffect(() => {
+    // External value changed — recompute our half and re-display
+    if (displayValue !== lastDisplayed.current) {
+      lastDisplayed.current = displayValue;
+      setLocal(String(displayValue));
+    }
+  }, [displayValue]);
+
+  const commit = (cleaned) => {
+    if (cleaned === '') return; // empty is fine while typing
+    const num = parseInt(cleaned, 10);
+    if (Number.isNaN(num)) return;
+    let newMins = mins;
+    let newSecs = secs;
+    if (mode === 'min') newMins = num;
+    else newSecs = num;
+    // Allow seconds > 59 to overflow naturally
+    const newTotalSec = newMins * 60 + newSecs;
+    const newDecimalMin = newTotalSec / 60;
+    lastDisplayed.current = mode === 'min' ? Math.floor(newTotalSec / 60) : (newTotalSec - Math.floor(newTotalSec / 60) * 60);
+    onChange(newDecimalMin);
+  };
+
+  return (
+    <div>
+      <div className="text-[9px] uppercase tracking-wider mb-0.5" style={{ color: BRAND.muted }}>{label}</div>
+      <input
+        type="text"
+        inputMode="numeric"
+        pattern="[0-9]*"
+        value={local}
+        onChange={(e) => {
+          const cleaned = e.target.value.replace(/[^0-9]/g, '');
+          setLocal(cleaned);
+          commit(cleaned);
+        }}
+        onBlur={() => {
+          if (local === '') {
+            // Empty on blur → 0 for that half; the other half stays
+            setLocal('0');
+            commit('0');
           }
         }}
         className="w-full px-1.5 py-1 text-xs border" style={{ borderColor: BRAND.line }} />
@@ -3054,10 +3272,22 @@ function ExportPanel({ project, updateProject, saveProject, exportImage, exportV
   );
 }
 
-function PresetsPanel({ project, loadPreset, savedProjects, loadProject, deleteProject, exportProjects, importProjects }) {
+function PresetsPanel({ project, loadPreset, clearProject, savedProjects, loadProject, deleteProject, exportProjects, importProjects }) {
   const presets = PRESETS[project.sport] || [];
   return (
     <div className="space-y-5">
+      <div>
+        <div className="font-display text-xs font-bold uppercase tracking-widest mb-2" style={{ color: BRAND.muted }}>Start Over</div>
+        <button onClick={clearProject}
+          className="font-display w-full flex items-center justify-center gap-1.5 py-2.5 text-xs font-semibold uppercase tracking-wider"
+          style={{ background: BRAND.white, border: `1px solid ${BRAND.line}`, color: '#a13d00' }}>
+          <Trash2 size={12} /> Clear all fields
+        </button>
+        <div className="text-[10px] mt-1.5" style={{ color: BRAND.muted }}>
+          Wipes title, segments, description, plan, caption, and annotations. Keeps your sport, format, layout, and background.
+        </div>
+      </div>
+
       <div>
         <div className="font-display text-xs font-bold uppercase tracking-widest mb-2" style={{ color: BRAND.muted }}>Library ({project.sport})</div>
         <div className="space-y-1.5">
