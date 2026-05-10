@@ -46,10 +46,10 @@ const ZONES_RUNNING = [
 
 // Style presets — sensible defaults for each annotation type, fully overridable
 const ANNOTATION_PRESETS = {
-  coach:    { label: "Coach's Tip",    bg: '#ffffff', text: '#1a1a1a', accent: '#c85103', accentBar: true },
-  science:  { label: 'Science Note',   bg: '#ffffff', text: '#1a1a1a', accent: '#6a714b', accentBar: true },
-  mistake:  { label: 'Common Mistake', bg: '#fff4ef', text: '#1a1a1a', accent: '#7a2d00', accentBar: true },
-  cue:      { label: 'Execution Cue',  bg: '#1a1a1a', text: '#ffffff', accent: '#c85103', accentBar: false },
+  coach:    { label: "Coach's Tip",    bg: '#ffffff', text: '#1a1a1a', accent: '#c85103', accentBar: true,  arrowStyle: 'solid' },
+  science:  { label: 'Science Note',   bg: '#ffffff', text: '#1a1a1a', accent: '#6a714b', accentBar: true,  arrowStyle: 'solid' },
+  mistake:  { label: 'Common Mistake', bg: '#fff4ef', text: '#1a1a1a', accent: '#7a2d00', accentBar: true,  arrowStyle: 'solid' },
+  cue:      { label: 'Execution Cue',  bg: '#1a1a1a', text: '#ffffff', accent: '#c85103', accentBar: true,  arrowStyle: 'dashed' },
 };
 
 const ARROW_STYLES = {
@@ -244,6 +244,36 @@ function calculateMetrics(flatSegs, sport) {
   return { totalMin, ifLow, ifHigh, tssLow: hours * Math.pow(ifLow, 2) * 100, tssHigh: hours * Math.pow(ifHigh, 2) * 100 };
 }
 
+/* Layer manual overrides on top of calculated metrics. The project may carry
+   `metricOverrides: { ifLow, ifHigh, tssLow, tssHigh }` where any defined
+   numeric value replaces the calculated one. Empty/missing values fall back
+   to the calculated number. Each metric is overridden independently — you can
+   override TSS without touching IF.
+   The hint values (`ifAuto`, etc) are also returned so the UI can show the
+   computed value next to the override field. */
+function applyMetricOverrides(calc, overrides) {
+  const o = overrides || {};
+  const pick = (k) => (typeof o[k] === 'number' && !Number.isNaN(o[k])) ? o[k] : calc[k];
+  return {
+    totalMin: calc.totalMin,
+    ifLow:  pick('ifLow'),
+    ifHigh: pick('ifHigh'),
+    tssLow:  pick('tssLow'),
+    tssHigh: pick('tssHigh'),
+    // Pass through the auto-calculated values so the UI can show "auto: X.YZ"
+    ifLowAuto: calc.ifLow,
+    ifHighAuto: calc.ifHigh,
+    tssLowAuto: calc.tssLow,
+    tssHighAuto: calc.tssHigh,
+    overridden: {
+      ifLow:  typeof o.ifLow  === 'number',
+      ifHigh: typeof o.ifHigh === 'number',
+      tssLow: typeof o.tssLow === 'number',
+      tssHigh: typeof o.tssHigh === 'number',
+    },
+  };
+}
+
 /* Format a duration (stored as decimal minutes) for display.
    - < 1min → "30s", "45s"
    - whole minutes < 60 → "5min", "20min"
@@ -296,13 +326,16 @@ function autoDraftDescription(title, segments, sport) {
   return `${title || 'This session'} delivers ${intensityWord} across ${zoneList} over ${fmtDuration(totalMin)}. The goal is to execute each interval with intent — controlled effort, smooth ${sport === 'cycling' ? 'cadence' : 'form'}, and consistent output from first to last.`;
 }
 
-function autoDraftCaption(title, segments, sport, description) {
+function autoDraftCaption(title, segments, sport, description, metricOverrides) {
   const flat = flattenSegments(segments);
-  const { totalMin, ifLow, ifHigh, tssLow, tssHigh } = calculateMetrics(flat, sport);
+  const calc = calculateMetrics(flat, sport);
+  const m = applyMetricOverrides(calc, metricOverrides);
+  const ifText = m.ifLow === m.ifHigh ? m.ifLow.toFixed(2) : `${m.ifLow.toFixed(2)}–${m.ifHigh.toFixed(2)}`;
+  const tssText = m.tssLow === m.tssHigh ? `${Math.round(m.tssLow)}` : `${Math.round(m.tssLow)}–${Math.round(m.tssHigh)}`;
   const tags = sport === 'cycling'
     ? '#cycling #ftp #sweetspot #vo2max #endurance #triathlon #cyclingtraining #pacelife'
     : '#running #threshold #vo2max #endurancerunning #marathon #triathlon #pacelife';
-  return `${title || "This week's key session"}\n\n${description}\n\n— Duration: ${fmtDuration(totalMin)}\n— IF: ${ifLow.toFixed(2)}–${ifHigh.toFixed(2)}\n— TSS: ${Math.round(tssLow)}–${Math.round(tssHigh)}\n\nPaceOn — evidence-driven coaching for athletes balancing ambition with life.\n\n#paceon ${tags}`;
+  return `${title || "This week's key session"}\n\n${description}\n\n— Duration: ${fmtDuration(m.totalMin)}\n— IF: ${ifText}\n— TSS: ${tssText}\n\nPaceOn — evidence-driven coaching for athletes balancing ambition with life.\n\n#paceon ${tags}`;
 }
 
 /* Auto-draft a detailed plan from the workout structure. Walks the segments tree
@@ -323,8 +356,8 @@ function autoDraftDetailedPlan(segments, sport) {
   const out = [];
   segments.forEach(s => {
     if (s.type === 'repeat') {
-      out.push(`${s.count} × Round`);
-      s.children.forEach(c => out.push('  ' + segLine(c)));
+      out.push(`**Repeat ${s.count}×**`);
+      s.children.forEach(c => out.push('- ' + segLine(c)));
       out.push(''); // blank line between blocks
     } else {
       out.push(segLine(s));
@@ -344,7 +377,7 @@ function migrateAnnotation(a) {
     accentColor: preset.accent,
     accentBar: preset.accentBar,
     arrowColor: preset.accent,
-    arrowStyle: 'solid',
+    arrowStyle: preset.arrowStyle || 'solid',
     arrowHead: 'filled',
     arrowWidth: 2,
     bubbleOpacity: 0.96,
@@ -383,6 +416,7 @@ function migrateProject(p) {
   return {
     detailedPlan: '',
     showGraphLabels: false,
+    metricOverrides: {},
     ...p,
     segments: (p.segments || []).map(migrateSegment),
     positions: { ...DEFAULT_POSITIONS, ...(p.positions || {}) },
@@ -498,20 +532,17 @@ function drawCanvas(ctx, opts) {
 
   // Metrics row + footer wordmark on both pages
   const metricsOffset = Math.round(pos.metricsY * H);
-  drawCalculations(ctx, flat, sport, pad, H, W, metricsOffset);
+  drawCalculations(ctx, project, flat, sport, pad, H, W, metricsOffset);
 
-  ctx.font = `600 ${Math.round(W * 0.018)}px "League Spartan", system-ui, sans-serif`;
-  ctx.fillStyle = 'rgba(255,255,255,0.55)';
-  ctx.textAlign = 'right';
-  ctx.fillText('paceon.com.au', W - pad, H - pad - Math.round(W * 0.07) + metricsOffset);
-
-  // Page indicator dots — bottom centre, subtle
-  drawPageIndicator(ctx, currentPage, W, H, pad);
+  // Page indicator dots — above the metrics row, subtle
+  drawPageIndicator(ctx, currentPage, W, H, pad, metricsOffset);
 }
 
-function drawPageIndicator(ctx, currentPage, W, H, pad) {
+function drawPageIndicator(ctx, currentPage, W, H, pad, metricsOffset = 0) {
   const cx = W / 2;
-  const y = H - pad - Math.round(W * 0.025);
+  // Sit above the metrics block (which has height roughly W * 0.12 from the bottom)
+  const totalBlockH = Math.round(W * 0.07) + Math.round(W * 0.025) + Math.round(W * 0.026);
+  const y = H - pad - totalBlockH - Math.round(W * 0.025) + metricsOffset;
   const r = Math.round(W * 0.008);
   const gap = r * 3;
   for (let p = 1; p <= 2; p++) {
@@ -842,12 +873,11 @@ function drawGraph(ctx, rect, flatSegs, sport, style, showLabels = false) {
           ? `${c.intensityLow}%`
           : `${c.intensityLow}–${c.intensityHigh}%`;
         return {
-          primary: `${u.count} × ${fmtDuration(c.duration)}`,
+          primary: `Repeat ${u.count}× ${fmtDuration(c.duration)}`,
           secondary: `@ ${intensity}`,
         };
       }
-      // Multi-child repeat — summarise as count × first-child desc, with extras
-      // collapsed into a brief tail. If too many children, just show count.
+      // Multi-child repeat — summarise as Repeat N× with each child described.
       const briefs = u.childSegs.map(c => {
         const intensity = c.intensityLow === c.intensityHigh
           ? `${c.intensityLow}%`
@@ -855,7 +885,7 @@ function drawGraph(ctx, rect, flatSegs, sport, style, showLabels = false) {
         return `${fmtDuration(c.duration)} @ ${intensity}`;
       });
       return {
-        primary: `${u.count} × Round`,
+        primary: `Repeat ${u.count}×`,
         secondary: briefs.length <= 2 ? briefs.join(' / ') : `${briefs[0]} + ${briefs.length - 1} more`,
       };
     };
@@ -921,6 +951,32 @@ function drawGraph(ctx, rect, flatSegs, sport, style, showLabels = false) {
   }
 }
 
+/* Compute the bounding box (in graph-rect coordinates) of all flat segments
+   that belong to a given repeat-block id. Used for annotation arrows that
+   target a whole repeat block rather than a single segment. */
+function getRepeatBlockBounds(repeatId, flatSegs, graphRect) {
+  const totalMin = flatSegs.reduce((s, x) => s + x.duration, 0) || 1;
+  let acc = 0;
+  let firstFrac = null;
+  let lastFrac = null;
+  let maxIntensity = 0;
+  for (const s of flatSegs) {
+    const startFrac = acc / totalMin;
+    const endFrac = (acc + s.duration) / totalMin;
+    if (s._repeatId === repeatId) {
+      if (firstFrac === null) firstFrac = startFrac;
+      lastFrac = endFrac;
+      maxIntensity = Math.max(maxIntensity, s.intensityHigh);
+    }
+    acc += s.duration;
+  }
+  if (firstFrac === null) return null;
+  const x = graphRect.x + 8 + ((firstFrac + lastFrac) / 2) * (graphRect.w - 16);
+  // Point arrow at the top of the tallest bar in the block (approximate)
+  const y = graphRect.y + graphRect.h * 0.3;
+  return { x, y };
+}
+
 function drawAnnotations(ctx, annotations, flatSegs, graphRect, W, hoverAnno) {
   if (!annotations.length) return;
   const totalMin = flatSegs.reduce((s, x) => s + x.duration, 0) || 1;
@@ -928,7 +984,17 @@ function drawAnnotations(ctx, annotations, flatSegs, graphRect, W, hoverAnno) {
   annotations.forEach(a => {
     if (!a.visible) return;
     let targetX, targetY;
-    if (a.targetMode === 'segment' && a.targetIndex != null && flatSegs[a.targetIndex]) {
+    if (a.targetMode === 'repeat' && a.targetRepeatId) {
+      const bounds = getRepeatBlockBounds(a.targetRepeatId, flatSegs, graphRect);
+      if (bounds) {
+        targetX = bounds.x;
+        targetY = bounds.y;
+      } else {
+        // Repeat no longer exists — fall back to free position
+        targetX = graphRect.x + (a.arrowPos?.x || 0.5) * graphRect.w;
+        targetY = graphRect.y + (a.arrowPos?.y || 0.5) * graphRect.h;
+      }
+    } else if (a.targetMode === 'segment' && a.targetIndex != null && flatSegs[a.targetIndex]) {
       let acc = 0;
       for (let i = 0; i < a.targetIndex; i++) acc += flatSegs[i].duration;
       const startFrac = acc / totalMin;
@@ -976,12 +1042,37 @@ function drawAnnotations(ctx, annotations, flatSegs, graphRect, W, hoverAnno) {
     const padB = 14;
     const labelSize = Math.round(W * 0.018);
     const bodySize = Math.round(W * 0.022);
+    const bodyLineHeight = bodySize * 1.3;
+    const family = 'Roboto, system-ui, sans-serif';
 
-    ctx.font = `400 ${bodySize}px Roboto, system-ui, sans-serif`;
-    const lines = wrapTextAll(ctx, a.text || '', bubbleW - padB * 2);
+    // Pre-wrap the rich-text body so we can size the bubble correctly
+    const bodyMaxWidth = bubbleW - padB * 2 - 4;
+    const parsedLines = (a.text || '').split('\n').map(line => parseRichLine(line, Math.round(W * 0.025)));
+    const bodyVisualLines = [];
+    for (const p of parsedLines) {
+      if (p.kind === 'blank') {
+        bodyVisualLines.push({ runs: [], indent: 0, isBulletStart: false, isBlank: true });
+        continue;
+      }
+      const bulletGutter = p.kind === 'bullet' ? Math.round(bodySize * 0.9) : 0;
+      const wrapWidth = bodyMaxWidth - p.indentPx - bulletGutter;
+      const wrapped = wrapStyledRuns(ctx, p.runs, wrapWidth, bodySize, family);
+      wrapped.forEach((runs, idx) => {
+        bodyVisualLines.push({
+          runs,
+          indent: p.indentPx + bulletGutter,
+          isBulletStart: p.kind === 'bullet' && idx === 0,
+          bulletIndent: p.indentPx,
+          isBlank: false,
+        });
+      });
+    }
+
     const labelLine = a.showLabel !== false;
     const labelText = a.customLabel || (ANNOTATION_PRESETS[a.style] || ANNOTATION_PRESETS.coach).label;
-    const bubbleH = padB * 2 + (labelLine ? labelSize + 8 : 0) + lines.length * (bodySize * 1.3);
+    let bodyContentH = 0;
+    for (const v of bodyVisualLines) bodyContentH += v.isBlank ? bodyLineHeight * 0.5 : bodyLineHeight;
+    const bubbleH = padB * 2 + (labelLine ? labelSize + 8 : 0) + bodyContentH;
 
     // Bubble background
     const bgColor = a.bgColor || '#ffffff';
@@ -1005,14 +1096,23 @@ function drawAnnotations(ctx, annotations, flatSegs, graphRect, W, hoverAnno) {
       ctx.fillText(labelText.toUpperCase(), noteX - bubbleW / 2 + padB + 4, noteY - bubbleH / 2 + padB);
     }
 
-    // Body
-    ctx.fillStyle = a.textColor || BRAND.ink;
-    ctx.font = `400 ${bodySize}px Roboto, system-ui, sans-serif`;
+    // Body — rich text rendering with bullets, bold, italic
     let ly = noteY - bubbleH / 2 + padB + (labelLine ? labelSize + 8 : 0);
-    lines.forEach(line => {
-      ctx.fillText(line, noteX - bubbleW / 2 + padB + 4, ly);
-      ly += bodySize * 1.3;
-    });
+    const bodyX = noteX - bubbleW / 2 + padB + 4;
+    const bodyColor = a.textColor || BRAND.ink;
+    for (const v of bodyVisualLines) {
+      if (v.isBlank) {
+        ly += bodyLineHeight * 0.5;
+        continue;
+      }
+      if (v.isBulletStart) {
+        ctx.font = `700 ${bodySize}px ${family}`;
+        ctx.fillStyle = a.accentColor || BRAND.orange;
+        ctx.fillText('•', bodyX + v.bulletIndent, ly);
+      }
+      drawStyledLine(ctx, v.runs, bodyX + v.indent, ly, bodySize, family, bodyColor);
+      ly += bodyLineHeight;
+    }
 
     // Hover indicator
     if (hoverAnno === a.id) {
@@ -1026,103 +1126,298 @@ function drawAnnotations(ctx, annotations, flatSegs, graphRect, W, hoverAnno) {
   });
 }
 
+/* Rich-text rendering helpers
+   ---------------------------------------------------------------
+   Both the description and detailed plan canvas renderers support a small
+   markdown-like subset:
+     - **bold**           → bold inline
+     - *italic* or _italic_ → italic inline
+     - lines starting with "- " or "* " (after optional leading spaces) → bullet
+     - leading spaces (in pairs) → indent depth for nested bullets
+     - unwrapped continuation lines stay aligned with the parent line, NO bullet
+
+   The previous implementation accidentally drew an orange dot on every
+   wrapped continuation line because indent > 0 was treated as "this is a
+   child item". The new pipeline tracks bullet-vs-continuation explicitly.
+*/
+
+// Parse a single source line into { kind, indentPx, runs } where runs is an
+// array of styled text fragments. indentStep is the pixel cost per indent level.
+function parseRichLine(rawLine, indentStep) {
+  const leadingSpaces = rawLine.length - rawLine.trimStart().length;
+  const indentDepth = Math.floor(leadingSpaces / 2);
+  const content = rawLine.trim();
+  const indentPx = indentDepth * indentStep;
+
+  if (!content) return { kind: 'blank', indentPx: 0, runs: [] };
+
+  // Detect bullet marker
+  const bulletMatch = content.match(/^[-*]\s+(.*)$/);
+  if (bulletMatch) {
+    return {
+      kind: 'bullet',
+      indentPx,
+      runs: parseInlineRuns(bulletMatch[1]),
+    };
+  }
+  return {
+    kind: 'text',
+    indentPx,
+    runs: parseInlineRuns(content),
+  };
+}
+
+// Parse a single line's text content into styled runs. Handles **bold**,
+// *italic* / _italic_. Runs are emitted in order; nested formatting isn't
+// supported (intentional — keeps parser simple, satisfies the use case).
+function parseInlineRuns(text) {
+  const runs = [];
+  let i = 0;
+  let buf = '';
+  let bold = false;
+  let italic = false;
+
+  const flush = () => {
+    if (buf) {
+      runs.push({ text: buf, bold, italic });
+      buf = '';
+    }
+  };
+
+  while (i < text.length) {
+    // ** for bold (longest match first so we don't trip on single *)
+    if (text[i] === '*' && text[i + 1] === '*') {
+      flush();
+      bold = !bold;
+      i += 2;
+      continue;
+    }
+    // * or _ for italic
+    if (text[i] === '*' || text[i] === '_') {
+      flush();
+      italic = !italic;
+      i++;
+      continue;
+    }
+    buf += text[i];
+    i++;
+  }
+  flush();
+  return runs.length ? runs : [{ text: '', bold: false, italic: false }];
+}
+
+// Measure the width of a styled run with the given base size and font family.
+function measureRun(ctx, run, size, family) {
+  const weight = run.bold ? 700 : 400;
+  const style = run.italic ? 'italic' : 'normal';
+  ctx.font = `${style} ${weight} ${size}px ${family}`;
+  return ctx.measureText(run.text).width;
+}
+
+// Wrap an array of styled runs to a max width, returning lines (each line is
+// an array of styled run fragments). Splits runs at word boundaries and
+// preserves styling across the split. The font family is needed for
+// measurement.
+function wrapStyledRuns(ctx, runs, maxWidth, size, family) {
+  const lines = [];
+  let currentLine = [];
+  let currentWidth = 0;
+
+  const pushLine = () => {
+    if (currentLine.length) lines.push(currentLine);
+    currentLine = [];
+    currentWidth = 0;
+  };
+
+  for (const run of runs) {
+    if (!run.text) continue;
+    // Split run into words (preserving spaces between them)
+    const tokens = run.text.split(/(\s+)/).filter(t => t.length > 0);
+    for (const token of tokens) {
+      const tokenWidth = measureRun(ctx, { ...run, text: token }, size, family);
+      const isWhitespace = /^\s+$/.test(token);
+
+      // Skip leading whitespace at the start of a wrapped line
+      if (isWhitespace && currentWidth === 0) continue;
+
+      if (currentWidth + tokenWidth > maxWidth && currentWidth > 0) {
+        pushLine();
+        if (isWhitespace) continue; // don't start a new line with whitespace
+      }
+      // Append to current line; merge with previous fragment if same style
+      const last = currentLine[currentLine.length - 1];
+      if (last && last.bold === run.bold && last.italic === run.italic) {
+        last.text += token;
+      } else {
+        currentLine.push({ text: token, bold: run.bold, italic: run.italic });
+      }
+      currentWidth += tokenWidth;
+    }
+  }
+  pushLine();
+  return lines;
+}
+
+// Render a single visual line (array of styled runs) at (x, y).
+function drawStyledLine(ctx, runs, x, y, size, family, color) {
+  let cx = x;
+  ctx.fillStyle = color;
+  ctx.textBaseline = 'top';
+  ctx.textAlign = 'left';
+  for (const run of runs) {
+    const weight = run.bold ? 700 : 400;
+    const style = run.italic ? 'italic' : 'normal';
+    ctx.font = `${style} ${weight} ${size}px ${family}`;
+    ctx.fillText(run.text, cx, y);
+    cx += ctx.measureText(run.text).width;
+  }
+}
+
+/* Render a block of rich text (description or plan) with proper handling of
+   wrapping, bullets, indentation, and inline formatting. */
+function drawRichText(ctx, text, opts) {
+  const {
+    x, y, maxWidth, size, lineHeight, indentStep, color, bulletColor,
+    family = 'Roboto, system-ui, sans-serif',
+    maxLines = Infinity,
+  } = opts;
+
+  if (!text) return { lastY: y, overflowed: false };
+
+  const parsed = text.split('\n').map(line => parseRichLine(line, indentStep));
+
+  // Build visual lines by wrapping each parsed source line
+  const visual = []; // { runs, indent, isBulletStart, isBlank }
+  for (const p of parsed) {
+    if (p.kind === 'blank') {
+      visual.push({ runs: [], indent: 0, isBulletStart: false, isBlank: true });
+      continue;
+    }
+    // For bullets, the first visual line gets the bullet marker; continuations
+    // align to where the bullet text started (indent + bulletGutter).
+    const bulletGutter = p.kind === 'bullet' ? Math.round(size * 0.9) : 0;
+    const wrapWidth = maxWidth - p.indentPx - bulletGutter;
+    const wrappedLines = wrapStyledRuns(ctx, p.runs, wrapWidth, size, family);
+    wrappedLines.forEach((runs, idx) => {
+      visual.push({
+        runs,
+        indent: p.indentPx + bulletGutter,
+        isBulletStart: p.kind === 'bullet' && idx === 0,
+        bulletIndent: p.indentPx, // where to place the bullet glyph
+        isBlank: false,
+      });
+    });
+  }
+
+  let cy = y;
+  let drawn = 0;
+  for (const v of visual) {
+    if (drawn >= maxLines) {
+      return { lastY: cy, overflowed: true };
+    }
+    if (v.isBlank) {
+      cy += lineHeight * 0.5;
+      drawn++;
+      continue;
+    }
+    if (v.isBulletStart) {
+      // Bullet glyph sits in the gutter between bulletIndent and indent
+      ctx.font = `700 ${size}px ${family}`;
+      ctx.fillStyle = bulletColor;
+      ctx.fillText('•', x + v.bulletIndent, cy);
+    }
+    drawStyledLine(ctx, v.runs, x + v.indent, cy, size, family, color);
+    cy += lineHeight;
+    drawn++;
+  }
+
+  return { lastY: cy, overflowed: false };
+}
+
 function drawDescription(ctx, text, x, y, w, W) {
   if (!text) return;
   const size = Math.round(W * 0.028);
-  ctx.font = `400 ${size}px Roboto, system-ui, sans-serif`;
-  ctx.fillStyle = 'rgba(255,255,255,0.92)';
-  ctx.textBaseline = 'top';
-  ctx.textAlign = 'left';
-  const lines = wrapTextAll(ctx, text, w);
-  let cy = y;
-  lines.slice(0, 8).forEach(line => {
-    ctx.fillText(line, x, cy);
-    cy += size * 1.4;
+  drawRichText(ctx, text, {
+    x, y, maxWidth: w, size,
+    lineHeight: size * 1.4,
+    indentStep: Math.round(W * 0.03),
+    color: 'rgba(255,255,255,0.92)',
+    bulletColor: BRAND.orange,
+    maxLines: 8,
   });
 }
 
 /* Detailed plan — page 2 body. Smaller type than description, more lines fit,
-   supports manual line breaks. Hierarchical indent: lines starting with "  "
-   render at the indent depth × indent step, useful for repeat-block children. */
+   supports manual line breaks. Bullets only appear on lines that start with
+   "- " or "* " — wrapped continuations align with the parent text but do NOT
+   get a bullet. */
 function drawDetailedPlan(ctx, text, x, y, w, W, H) {
   if (!text) return;
   const size = Math.round(W * 0.022);
   const lineHeight = size * 1.45;
-  const indentStep = Math.round(W * 0.025);
-  ctx.font = `400 ${size}px Roboto, system-ui, sans-serif`;
-  ctx.fillStyle = 'rgba(255,255,255,0.94)';
-  ctx.textBaseline = 'top';
-  ctx.textAlign = 'left';
 
   // Available height: from y down to roughly the start of the metrics row
   const maxBottom = H - Math.round(W * 0.16);
   const maxLines = Math.max(1, Math.floor((maxBottom - y) / lineHeight));
 
-  const rendered = [];
-  text.split('\n').forEach(rawLine => {
-    // Detect leading whitespace as indent depth (each two spaces = one level)
-    const leadingSpaces = rawLine.length - rawLine.trimStart().length;
-    const indentDepth = Math.floor(leadingSpaces / 2);
-    const content = rawLine.trim();
-    const indentPx = indentDepth * indentStep;
-
-    if (!content) {
-      rendered.push({ text: '', indent: 0 }); // blank line
-      return;
-    }
-    // Wrap each paragraph respecting available width minus indent
-    const wrapped = wrapTextAll(ctx, content, w - indentPx);
-    wrapped.forEach((line, i) => {
-      // Continuation lines (after the first) get an extra small indent so they read as one paragraph
-      const px = indentPx + (i === 0 ? 0 : indentStep * 0.5);
-      rendered.push({ text: line, indent: px });
-    });
+  const result = drawRichText(ctx, text, {
+    x, y, maxWidth: w, size, lineHeight,
+    indentStep: Math.round(W * 0.025),
+    color: 'rgba(255,255,255,0.94)',
+    bulletColor: BRAND.orange,
+    maxLines,
   });
 
-  let cy = y;
-  rendered.slice(0, maxLines).forEach(({ text: line, indent }) => {
-    if (line) {
-      // Bullet for indented (child) lines
-      if (indent > 0) {
-        ctx.fillStyle = BRAND.orange;
-        ctx.fillText('·', x + indent - Math.round(W * 0.012), cy);
-        ctx.fillStyle = 'rgba(255,255,255,0.94)';
-      }
-      ctx.fillText(line, x + indent, cy);
-    }
-    cy += lineHeight;
-  });
-
-  // Ellipsis indicator if we ran out of room
-  if (rendered.length > maxLines) {
+  if (result.overflowed) {
     ctx.fillStyle = 'rgba(255,255,255,0.5)';
     ctx.font = `500 ${Math.round(W * 0.018)}px Roboto, system-ui, sans-serif`;
-    ctx.fillText('…', x, cy);
+    ctx.fillText('…', x, result.lastY);
   }
 }
 
-function drawCalculations(ctx, flatSegs, sport, pad, H, W, yOffset = 0) {
+function drawCalculations(ctx, project, flatSegs, sport, pad, H, W, yOffset = 0) {
   if (!flatSegs.length) return;
-  const m = calculateMetrics(flatSegs, sport);
+  const calc = calculateMetrics(flatSegs, sport);
+  const m = applyMetricOverrides(calc, project.metricOverrides);
   const pillH = Math.round(W * 0.07);
-  const y = H - pad - pillH + yOffset;
   const pillSize = Math.round(W * 0.022);
   const labelSize = Math.round(W * 0.016);
+  // Wordmark sits BELOW the metrics row; reserve space for it
+  const wordmarkSize = Math.round(W * 0.026);
+  const wordmarkGap = Math.round(W * 0.025);
+  const totalBlockH = pillH + wordmarkGap + wordmarkSize;
+  const y = H - pad - totalBlockH + yOffset;
+
+  const fmtIF = (v) => v.toFixed(2);
+  const fmtTSS = (v) => `${Math.round(v)}`;
+
+  // Build items with both range and override-aware single-value display:
+  // if the user has overridden BOTH low and high to the same value, show it
+  // as a single number rather than a range like "75–75".
+  const ifRange = (m.ifLow === m.ifHigh) ? fmtIF(m.ifLow) : `${fmtIF(m.ifLow)}–${fmtIF(m.ifHigh)}`;
+  const tssRange = (m.tssLow === m.tssHigh) ? fmtTSS(m.tssLow) : `${fmtTSS(m.tssLow)}–${fmtTSS(m.tssHigh)}`;
 
   const items = [
     { label: 'DURATION', value: fmtDuration(m.totalMin) },
-    { label: sport === 'cycling' ? 'IF' : 'rIF', value: `${m.ifLow.toFixed(2)}–${m.ifHigh.toFixed(2)}` },
-    { label: sport === 'cycling' ? 'TSS' : 'rTSS', value: `${Math.round(m.tssLow)}–${Math.round(m.tssHigh)}` },
+    { label: sport === 'cycling' ? 'IF' : 'rIF', value: ifRange },
+    { label: sport === 'cycling' ? 'TSS' : 'rTSS', value: tssRange },
   ];
 
-  let cx = pad;
-  items.forEach(item => {
+  // First pass: measure each pill's width
+  const pillWidths = items.map(item => {
     ctx.font = `700 ${pillSize}px "League Spartan", system-ui, sans-serif`;
     const valW = ctx.measureText(item.value).width;
     ctx.font = `600 ${labelSize}px "League Spartan", system-ui, sans-serif`;
     const labW = ctx.measureText(item.label).width;
-    const pillW = Math.max(valW, labW) + 36;
+    return Math.max(valW, labW) + 36;
+  });
+  const gap = 12;
+  const totalW = pillWidths.reduce((sum, w) => sum + w, 0) + gap * (items.length - 1);
+  // Centre the row horizontally
+  let cx = Math.round((W - totalW) / 2);
 
+  items.forEach((item, idx) => {
+    const pillW = pillWidths[idx];
     ctx.fillStyle = 'rgba(255,255,255,0.1)';
     roundRect(ctx, cx, y, pillW, pillH, 4);
     ctx.fill();
@@ -1141,8 +1436,15 @@ function drawCalculations(ctx, flatSegs, sport, pad, H, W, yOffset = 0) {
     ctx.font = `700 ${pillSize}px "League Spartan", system-ui, sans-serif`;
     ctx.fillText(item.value, cx + 14, y + 10 + labelSize + 4);
 
-    cx += pillW + 12;
+    cx += pillW + gap;
   });
+
+  // Wordmark — centred under the metrics row, larger and brighter than before
+  ctx.font = `700 ${wordmarkSize}px "League Spartan", system-ui, sans-serif`;
+  ctx.fillStyle = 'rgba(255,255,255,0.78)';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  ctx.fillText('paceon.com.au', W / 2, y + pillH + wordmarkGap);
 }
 
 function roundRect(ctx, x, y, w, h, r) {
@@ -1187,6 +1489,7 @@ const DEFAULT_PROJECT = {
   caption: '',
   annotations: [],
   showGraphLabels: false,
+  metricOverrides: {},
   background: { tint: 0.55, gradient: true, gradientTop: 0.4, gradientBottom: 0.7 },
   // logo state stripped of `image` — image lives in a ref, never in saved JSON
   logo: { variant: 'white', hasCustom: false },
@@ -1238,7 +1541,10 @@ export default function App() {
 
   const format = FORMATS[project.format];
   const flat = useMemo(() => flattenSegments(project.segments), [project.segments]);
-  const metrics = useMemo(() => calculateMetrics(flat, project.sport), [flat, project.sport]);
+  const metrics = useMemo(() => {
+    const calc = calculateMetrics(flat, project.sport);
+    return applyMetricOverrides(calc, project.metricOverrides);
+  }, [flat, project.sport, project.metricOverrides]);
 
   // Resolve which logo image to draw (computed each render, never stored)
   const activeLogoImage = useMemo(() => {
@@ -1351,7 +1657,14 @@ export default function App() {
       const noteY = graphRect.y + (a.notePos?.y ?? -0.3) * graphRect.h;
       const totalMin = flat.reduce((s, x) => s + x.duration, 0) || 1;
       let targetX, targetY;
-      if (a.targetMode === 'segment' && a.targetIndex != null && flat[a.targetIndex]) {
+      if (a.targetMode === 'repeat' && a.targetRepeatId) {
+        const bounds = getRepeatBlockBounds(a.targetRepeatId, flat, graphRect);
+        if (bounds) { targetX = bounds.x; targetY = bounds.y; }
+        else {
+          targetX = graphRect.x + (a.arrowPos?.x || 0.5) * graphRect.w;
+          targetY = graphRect.y + (a.arrowPos?.y || 0.5) * graphRect.h;
+        }
+      } else if (a.targetMode === 'segment' && a.targetIndex != null && flat[a.targetIndex]) {
         let acc = 0;
         for (let i = 0; i < a.targetIndex; i++) acc += flat[i].duration;
         const startFrac = acc / totalMin;
@@ -1369,7 +1682,9 @@ export default function App() {
         setDraggingAnno({ id: a.id, mode: 'note' });
         return true;
       }
-      if (a.targetMode !== 'segment' && Math.hypot(x - targetX, y - targetY) < 30) {
+      // Free-position arrows are draggable; segment- or repeat-anchored ones are not
+      if (a.targetMode !== 'segment' && a.targetMode !== 'repeat' &&
+          Math.hypot(x - targetX, y - targetY) < 30) {
         setDraggingAnno({ id: a.id, mode: 'arrow' });
         return true;
       }
@@ -1560,7 +1875,7 @@ export default function App() {
           accentColor: preset.accent,
           accentBar: preset.accentBar,
           arrowColor: preset.accent,
-          arrowStyle: 'solid',
+          arrowStyle: preset.arrowStyle || 'solid',
           arrowHead: 'filled',
           arrowWidth: 2,
           bubbleOpacity: 0.96,
@@ -1905,7 +2220,7 @@ export default function App() {
   };
 
   const autoFillDescription = () => updateProject({ description: autoDraftDescription(project.title, project.segments, project.sport) });
-  const autoFillCaption = () => updateProject({ caption: autoDraftCaption(project.title, project.segments, project.sport, project.description) });
+  const autoFillCaption = () => updateProject({ caption: autoDraftCaption(project.title, project.segments, project.sport, project.description, project.metricOverrides) });
   const autoFillDetailedPlan = () => updateProject({ detailedPlan: autoDraftDetailedPlan(project.segments, project.sport) });
 
   // ---------- Subviews used by both desktop and mobile ----------
@@ -2224,11 +2539,67 @@ function Toggle({ label, options, value, onChange, accent, getOptionLabel }) {
   );
 }
 
-function Metric({ label, value }) {
+function Metric({ label, value, highlight }) {
   return (
-    <div className="border p-2" style={{ borderColor: BRAND.line, background: BRAND.white }}>
+    <div className="border p-2"
+      style={{
+        borderColor: highlight ? BRAND.orange : BRAND.line,
+        background: BRAND.white,
+        borderWidth: highlight ? 2 : 1,
+      }}>
       <div className="font-display text-[9px] font-semibold uppercase tracking-wider" style={{ color: BRAND.orange }}>{label}</div>
       <div className="font-display text-sm font-bold mt-0.5" style={{ color: BRAND.ink }}>{value}</div>
+    </div>
+  );
+}
+
+/* OverrideField — small numeric input used for IF/TSS overrides. The value is
+   either a number (override active) or undefined (use auto-calculated). The
+   placeholder shows the auto-calculated value so the user knows what they're
+   overriding. Empty string commits as "remove override" so the field falls
+   back to auto. */
+function OverrideField({ label, value, placeholder, step, onChange }) {
+  const [local, setLocal] = useState(typeof value === 'number' ? String(value) : '');
+  const lastExternal = useRef(value);
+
+  useEffect(() => {
+    if (value !== lastExternal.current) {
+      lastExternal.current = value;
+      setLocal(typeof value === 'number' ? String(value) : '');
+    }
+  }, [value]);
+
+  const commit = (raw) => {
+    if (raw === '' || raw === '.') {
+      lastExternal.current = undefined;
+      onChange('');
+      return;
+    }
+    const num = parseFloat(raw);
+    if (!Number.isNaN(num)) {
+      lastExternal.current = num;
+      onChange(num);
+    }
+  };
+
+  return (
+    <div>
+      <div className="text-[9px] uppercase tracking-wider mb-0.5" style={{ color: BRAND.muted }}>{label}</div>
+      <input
+        type="text"
+        inputMode="decimal"
+        pattern="[0-9]*\.?[0-9]*"
+        value={local}
+        placeholder={placeholder}
+        onChange={(e) => {
+          const cleaned = e.target.value.replace(/[^0-9.]/g, '').replace(/(\..*)\./g, '$1');
+          setLocal(cleaned);
+          commit(cleaned);
+        }}
+        onBlur={() => {
+          // No special blur behaviour — empty stays empty (auto), valid stays valid
+        }}
+        className="w-full px-1.5 py-1 text-xs border" style={{ borderColor: BRAND.line }} />
     </div>
   );
 }
@@ -2904,6 +3275,7 @@ function AnnotatePanel({ project, flat, addAnnotation, updateAnnotation, removeA
                       bgColor: preset.bg, textColor: preset.text,
                       accentColor: preset.accent, accentBar: preset.accentBar,
                       arrowColor: preset.accent,
+                      arrowStyle: preset.arrowStyle || 'solid',
                     });
                   }}
                     className="font-display text-[10px] font-semibold uppercase tracking-wider bg-transparent">
@@ -2928,15 +3300,36 @@ function AnnotatePanel({ project, flat, addAnnotation, updateAnnotation, removeA
                 </div>
               </div>
 
-              <div className="text-[10px] mb-1 font-display uppercase tracking-wider" style={{ color: BRAND.muted }}>Target Segment</div>
-              <select value={a.targetMode === 'segment' ? a.targetIndex : 'free'}
+              <div className="text-[10px] mb-1 font-display uppercase tracking-wider" style={{ color: BRAND.muted }}>Target</div>
+              <select
+                value={
+                  a.targetMode === 'segment' ? `segment:${a.targetIndex}` :
+                  a.targetMode === 'repeat'  ? `repeat:${a.targetRepeatId}` :
+                  'free'
+                }
                 onChange={e => {
-                  if (e.target.value === 'free') updateAnnotation(a.id, { targetMode: 'free' });
-                  else updateAnnotation(a.id, { targetMode: 'segment', targetIndex: parseInt(e.target.value) });
+                  const v = e.target.value;
+                  if (v === 'free') updateAnnotation(a.id, { targetMode: 'free' });
+                  else if (v.startsWith('segment:')) {
+                    updateAnnotation(a.id, { targetMode: 'segment', targetIndex: parseInt(v.slice(8), 10) });
+                  } else if (v.startsWith('repeat:')) {
+                    updateAnnotation(a.id, { targetMode: 'repeat', targetRepeatId: v.slice(7) });
+                  }
                 }}
                 className="w-full text-xs px-1.5 py-1 border mb-2" style={{ borderColor: BRAND.line }}>
+                {/* Repeat blocks first (they're usually what coaches want to point at) */}
+                {project.segments.filter(s => s.type === 'repeat').map(r => {
+                  const childSummary = r.children.length === 1
+                    ? `${fmtDuration(r.children[0].duration)} @ ${r.children[0].intensityLow}%`
+                    : `${r.children.length} steps`;
+                  return (
+                    <option key={`r-${r.id}`} value={`repeat:${r.id}`}>
+                      🔁 Repeat {r.count}× — {childSummary}
+                    </option>
+                  );
+                })}
                 {flat.map((s, i) => (
-                  <option key={i} value={i}>{i + 1}. {s.label} ({fmtDuration(s.duration)})</option>
+                  <option key={`s-${i}`} value={`segment:${i}`}>{i + 1}. {s.label} ({fmtDuration(s.duration)})</option>
                 ))}
                 <option value="free">— Free position (drag tip) —</option>
               </select>
@@ -2946,6 +3339,9 @@ function AnnotatePanel({ project, flat, addAnnotation, updateAnnotation, removeA
                 onCommit={(text) => updateAnnotation(a.id, { text })}
                 rows={4}
                 className="w-full text-xs px-1.5 py-1 border" style={{ borderColor: BRAND.line, resize: 'vertical' }} />
+              <div className="text-[10px] mt-1 leading-relaxed" style={{ color: BRAND.muted }}>
+                <strong>**bold**</strong>, <em>*italic*</em>, <code>- text</code> for a bullet.
+              </div>
             </div>
 
             {expandedAnno === a.id && (
@@ -3116,17 +3512,60 @@ function LayoutPanel({ project, updateProject }) {
    and as the "Content" tab on mobile (embedded=false → tab-style spacing). */
 function ContentPanel({ project, updateProject, metrics, autoFillDescription, autoFillCaption, autoFillDetailedPlan, embedded = false }) {
   const sectionClass = embedded ? "p-4 border-b" : "pb-4 border-b mb-4";
+
+  const setOverride = (key, val) => {
+    const o = { ...(project.metricOverrides || {}) };
+    if (val === '' || val === null || val === undefined) delete o[key];
+    else o[key] = val;
+    updateProject({ metricOverrides: o });
+  };
+
+  const ifLabel  = project.sport === 'cycling' ? 'IF'  : 'rIF';
+  const tssLabel = project.sport === 'cycling' ? 'TSS' : 'rTSS';
+  const fmtIF = v => v.toFixed(2);
+
   return (
     <div className={embedded ? "" : "space-y-0"}>
       <div className={sectionClass} style={{ borderColor: BRAND.line }}>
         <div className="font-display text-xs font-bold uppercase tracking-widest mb-3" style={{ color: BRAND.muted }}>Session Metrics</div>
         <div className="grid grid-cols-3 gap-2">
           <Metric label="Duration" value={fmtDuration(metrics.totalMin)} />
-          <Metric label={project.sport === 'cycling' ? 'IF' : 'rIF'} value={`${metrics.ifLow.toFixed(2)}–${metrics.ifHigh.toFixed(2)}`} />
-          <Metric label={project.sport === 'cycling' ? 'TSS' : 'rTSS'} value={`${Math.round(metrics.tssLow)}–${Math.round(metrics.tssHigh)}`} />
+          <Metric
+            label={ifLabel + (metrics.overridden.ifLow || metrics.overridden.ifHigh ? ' ·' : '')}
+            value={metrics.ifLow === metrics.ifHigh ? fmtIF(metrics.ifLow) : `${fmtIF(metrics.ifLow)}–${fmtIF(metrics.ifHigh)}`}
+            highlight={metrics.overridden.ifLow || metrics.overridden.ifHigh}
+          />
+          <Metric
+            label={tssLabel + (metrics.overridden.tssLow || metrics.overridden.tssHigh ? ' ·' : '')}
+            value={metrics.tssLow === metrics.tssHigh ? `${Math.round(metrics.tssLow)}` : `${Math.round(metrics.tssLow)}–${Math.round(metrics.tssHigh)}`}
+            highlight={metrics.overridden.tssLow || metrics.overridden.tssHigh}
+          />
         </div>
         <div className="text-[10px] mt-2" style={{ color: BRAND.muted }}>
-          Ranges reflect the low–high intensity of each segment.
+          Auto-calculated from segments. Use the override fields below to set fixed values (e.g. from a TrainingPeaks workout).
+        </div>
+
+        <div className="mt-3">
+          <div className="font-display text-[10px] font-bold uppercase tracking-widest mb-1.5" style={{ color: BRAND.muted }}>
+            Manual Overrides
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <OverrideField label={`${ifLabel} low`} placeholder={metrics.ifLowAuto.toFixed(2)} step={0.01}
+              value={project.metricOverrides?.ifLow}
+              onChange={v => setOverride('ifLow', v)} />
+            <OverrideField label={`${ifLabel} high`} placeholder={metrics.ifHighAuto.toFixed(2)} step={0.01}
+              value={project.metricOverrides?.ifHigh}
+              onChange={v => setOverride('ifHigh', v)} />
+            <OverrideField label={`${tssLabel} low`} placeholder={`${Math.round(metrics.tssLowAuto)}`} step={1}
+              value={project.metricOverrides?.tssLow}
+              onChange={v => setOverride('tssLow', v)} />
+            <OverrideField label={`${tssLabel} high`} placeholder={`${Math.round(metrics.tssHighAuto)}`} step={1}
+              value={project.metricOverrides?.tssHigh}
+              onChange={v => setOverride('tssHigh', v)} />
+          </div>
+          <div className="text-[10px] mt-1.5" style={{ color: BRAND.muted }}>
+            Leave blank to use auto-calculated. Set both low and high to the same number to display a single value (e.g. {ifLabel} 0.85 instead of 0.83–0.87).
+          </div>
         </div>
       </div>
 
@@ -3147,8 +3586,8 @@ function ContentPanel({ project, updateProject, metrics, autoFillDescription, au
         </div>
         <DebouncedTextarea value={project.description} onCommit={v => updateProject({ description: v })} rows={4}
           className="w-full px-3 py-2 text-sm border" style={{ borderColor: BRAND.line, background: BRAND.white, resize: 'vertical' }} />
-        <div className="text-[10px] mt-1" style={{ color: BRAND.muted }}>
-          Short overview shown on the first slide.
+        <div className="text-[10px] mt-1 leading-relaxed" style={{ color: BRAND.muted }}>
+          Short overview shown on the first slide. Format inline: <strong>**bold**</strong>, <em>*italic*</em>. Start a line with <code>- </code> or <code>* </code> for a bullet.
         </div>
       </div>
 
@@ -3162,10 +3601,10 @@ function ContentPanel({ project, updateProject, metrics, autoFillDescription, au
           </button>
         </div>
         <DebouncedTextarea value={project.detailedPlan} onCommit={v => updateProject({ detailedPlan: v })} rows={8}
-          placeholder={"Add a structured breakdown of the session.\nIndent lines with two spaces to bullet them under the line above\n  e.g. as children of a repeat block."}
+          placeholder={"Structured breakdown of the session.\n\nFormatting:\n  **bold** and *italic* for emphasis\n  - or * to start a bullet\n  Two leading spaces for nested indent\n\nExample:\n  **Repeat 3×**\n  - 30s @ 120% FTP (Z5)\n  - 4m 30s @ 70% FTP (Z2)"}
           className="w-full px-3 py-2 text-xs border font-mono" style={{ borderColor: BRAND.line, background: BRAND.white, resize: 'vertical' }} />
-        <div className="text-[10px] mt-1" style={{ color: BRAND.muted }}>
-          Indent with two spaces for nested steps. Auto-draft generates this from your workout structure.
+        <div className="text-[10px] mt-1 leading-relaxed" style={{ color: BRAND.muted }}>
+          Bullets: <code>- text</code> or <code>* text</code>. Inline: <strong>**bold**</strong>, <em>*italic*</em>. Indent with 2 spaces for nested items. Wrapped lines stay aligned without a phantom bullet.
         </div>
       </div>
 
